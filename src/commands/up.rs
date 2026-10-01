@@ -36,6 +36,7 @@ use crate::commands::remote_host::{DashboardLock, DashboardLockMode, HostDescrip
 use crate::commands::up_remote::RemoteSessionStatus;
 use crate::error::{anyhow, Result};
 use crate::local;
+use crate::local::autonomy::Autonomy;
 use crate::local::chat::ChatHost;
 use crate::local::is_terminal;
 use crate::local::opencode::AgentHost;
@@ -5351,6 +5352,7 @@ struct SetUiStateReq {
     #[serde(default)]
     preferred_agent: Option<StoredAgentSelectionReq>,
     workspace: Option<GlobalWorkspaceState>,
+    preferred_autonomy: Option<Autonomy>,
 }
 
 #[derive(Deserialize)]
@@ -5402,6 +5404,9 @@ async fn set_ui_state(Json(req): Json<SetUiStateReq>) -> ApiResult {
         }
         if let Some(selection) = selection {
             store.set_preferred_agent(&selection)?;
+        }
+        if let Some(autonomy) = req.preferred_autonomy {
+            store.set_preferred_autonomy(autonomy)?;
         }
         if let Some(workspace) = req.workspace {
             store.set_global_workspace_state(&workspace)?;
@@ -6927,6 +6932,7 @@ struct CreateChatSessionReq {
     #[serde(default)]
     plan_mode: bool,
     reasoning_level: Option<String>,
+    autonomy: Option<Autonomy>,
 }
 
 async fn create_chat_session(
@@ -6982,6 +6988,7 @@ async fn create_chat_session(
         context_usage_json: None,
         bootstrap_context: None,
         goal: None,
+        autonomy: req.autonomy.map(|autonomy| autonomy.id().to_string()),
         active_leaf_id: None,
         parent_session_id: None,
         created_at: now_ms(),
@@ -7082,6 +7089,7 @@ struct UpdateChatSessionReq {
     /// Present-and-null clears the goal, which is why it is doubly wrapped.
     #[serde(default, deserialize_with = "present_nullable_string")]
     goal: Option<Option<String>>,
+    autonomy: Option<Autonomy>,
 }
 
 async fn update_chat_session(
@@ -7125,6 +7133,12 @@ async fn update_chat_session(
         state
             .chat
             .set_permission_mode(&id, &permission_mode)
+            .await?
+            .ok_or_else(|| not_found("chat session"))?
+    } else if let Some(autonomy) = req.autonomy {
+        state
+            .chat
+            .set_autonomy(&id, autonomy)
             .await?
             .ok_or_else(|| not_found("chat session"))?
     } else {
@@ -8100,6 +8114,7 @@ mod tests {
             tour_completed: Some(true),
             preferred_agent: None,
             workspace: Some(invalid),
+            preferred_autonomy: None,
         }))
         .await;
         assert_eq!(result.err().unwrap().0, StatusCode::BAD_REQUEST);
