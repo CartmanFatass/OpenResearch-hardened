@@ -103,7 +103,11 @@ fn default_summary_shows_bounded_path_size_preview_and_hint() {
         .split_once("Here are the last 500 characters of the log file:\n")
         .unwrap()
         .1;
-    let (preview, _) = report.split_once("\nUse targeted search").unwrap();
+    // The preview is wrapped in untrusted-content markers so agents treat it
+    // as data, never as instructions.
+    assert!(report.contains("Untrusted remote content follows."));
+    let wrapped = report.split_once("<untrusted-source>\n").unwrap().1;
+    let (preview, _) = wrapped.split_once("\n</untrusted-source>").unwrap();
     assert_eq!(preview.chars().count(), 500);
     assert!(stdout.contains("targeted search"));
     assert!(stdout.contains("Avoid reading the entire log file at once into the context window"));
@@ -124,10 +128,10 @@ fn utf8_preview_respects_character_boundaries() {
     assert!(output.status.success());
     let stdout = lossy_stdout(&output);
     let report = stdout
-        .split_once("Here are the last 500 characters of the log file:\n")
+        .split_once("<untrusted-source>\n")
         .unwrap()
         .1;
-    let (preview, _) = report.split_once("\nUse targeted search").unwrap();
+    let (preview, _) = report.split_once("\n</untrusted-source>").unwrap();
     let expected_preview: String = body
         .chars()
         .rev()
