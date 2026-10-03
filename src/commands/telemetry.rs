@@ -29,12 +29,14 @@ fn status() -> Result<()> {
         None => println!("  Anonymous install id: (not yet generated)"),
     }
     println!();
-    println!("Set your preference with `orx telemetry off` or `orx telemetry on`.");
+    println!("Telemetry is off by default. Run `orx telemetry on` to opt in,");
+    println!("or `orx telemetry off` to keep it off.");
     Ok(())
 }
 
 async fn set_enabled(enabled: bool) -> Result<()> {
-    // Eligible official builds record the decision even for an opt-out.
+    // Centralized consent rule: the agree is always recorded; a decline is only
+    // sent when the user had actually opted in (see `record_consent`).
     telemetry::record_consent(enabled).await;
     telemetry::set_persisted_disabled(!enabled)
         .map_err(|e| anyhow!("Could not save telemetry setting: {e}"))?;

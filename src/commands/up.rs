@@ -5092,7 +5092,14 @@ fn telemetry_settings_json() -> Value {
         }
         Some(r) => {
             let reason = r.as_str();
-            let locked = !matches!(r, crate::telemetry::DisabledReason::Persisted);
+            // `Persisted` and `NotOptedIn` are the user's own preference state,
+            // so the dashboard switch may flip them; every other reason is
+            // environmental and leaves the switch locked.
+            let locked = !matches!(
+                r,
+                crate::telemetry::DisabledReason::Persisted
+                    | crate::telemetry::DisabledReason::NotOptedIn
+            );
             json!({ "enabled": false, "preferenceEnabled": preference_enabled, "locked": locked, "reason": reason })
         }
     }

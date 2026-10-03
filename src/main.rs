@@ -48,8 +48,8 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
-    /// Disable anonymous usage analytics for this run. To disable it
-    /// persistently, run `orx telemetry off`.
+    /// Disable anonymous usage analytics for this run. Analytics are off
+    /// unless you opt in with `orx telemetry on`.
     #[arg(long, global = true)]
     no_telemetry: bool,
 }

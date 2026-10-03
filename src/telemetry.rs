@@ -1,4 +1,4 @@
-//! Opt-out usage analytics → the first-party OpenResearch API.
+//! Opt-in usage analytics → the first-party OpenResearch API.
 //!
 //! Why this exists: `orx` shipped with no telemetry, so we had no way to see
 //! installs, DAU/WAU, retention, or which commands people actually use. This
@@ -10,11 +10,13 @@
 //! - **Official builds only.** Source builds never send production telemetry or
 //!   generate an install id. The official release workflow embeds the immutable
 //!   production build channel; a runtime override may only disable it.
-//! - **Opt-out.** A `--no-telemetry` flag and a persistent `orx telemetry off`
-//!   (also toggleable from `orx up`). Disabled product telemetry sends nothing
-//!   and generates no install id. The telemetry choice itself is the sole
-//!   exception: it is queued durably so opt-outs are observable; see
-//!   `record_consent`.
+//! - **Opt-in.** Product telemetry is off unless the user runs `orx telemetry
+//!   on` (also toggleable from `orx up`); a `--no-telemetry` flag, a non-empty
+//!   `ORX_NO_TELEMETRY`, or a persistent `orx telemetry off` disables it again.
+//!   Disabled product telemetry sends nothing and generates no install id. The
+//!   telemetry choice itself is the partial exception: the agree is always
+//!   recorded, and a decline lands only for an install that had actually been
+//!   opted in; see `record_consent`.
 //! - **Never blocks or crashes the CLI.** Events enter a disk-backed outbox,
 //!   then send on a background task with a bounded flush window. Failed sends
 //!   retry on the next run; telemetry errors never enter a command's `?` chain.
@@ -94,7 +96,8 @@ fn flush_window() -> Duration {
 }
 
 // ---------------------------------------------------------------------------
-// Settings — install id + persisted opt-out, at config_dir()/settings.json
+// Settings — install id + persisted telemetry preference (opt-in), at
+// config_dir()/settings.json
 // ---------------------------------------------------------------------------
 
 /// Machine-local CLI settings. Lives at `$XDG_CONFIG_HOME/openresearch/
@@ -115,6 +118,11 @@ pub(crate) struct Settings {
     /// Set by `orx telemetry off`. `Some(true)` = user opted out persistently.
     #[serde(default)]
     pub telemetry_disabled: Option<bool>,
+    /// Set by `orx telemetry on`. `Some(true)` = user explicitly opted in;
+    /// absent/`None` = not opted in, so product telemetry stays off (opt-in
+    /// default). Skipped when absent so fresh settings files stay clean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry_enabled: Option<bool>,
     /// User-chosen data directory (Storage settings). Absent = fall back to the
     /// env/XDG/default chain in `store::data_dir()`. Persisted here — in the one
     /// `settings.json` — so a write can't clobber `install_id`/`telemetry_disabled`
@@ -298,12 +306,15 @@ pub(crate) fn set_github_for_new_projects(enabled: bool) -> std::io::Result<()> 
     mutate_settings(|settings| settings.github_for_new_projects = Some(enabled))
 }
 
-/// Whether orx may apply updates on its own. Defaults to enabled — the whole
-/// point is that an install nobody tends stays current.
+/// Whether orx may apply updates on its own. Opt-in for this hardened fork:
+/// downloading and executing an installer silently is exactly the behavior a
+/// security-sensitive install should not do unattended. The check and the
+/// outdated warning still run; enable via the dashboard setting to restore
+/// silent self-update.
 pub(crate) fn auto_update_enabled() -> bool {
     load_settings()
         .and_then(|settings| settings.auto_update)
-        .unwrap_or(true)
+        .unwrap_or(false)
 }
 
 pub(crate) fn set_auto_update_enabled(enabled: bool) -> std::io::Result<()> {
@@ -521,7 +532,7 @@ pub(crate) fn install_id() -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Opt-out decision
+// Disable decision
 // ---------------------------------------------------------------------------
 
 /// Why telemetry is off, for `orx telemetry status`. `None` = enabled.
@@ -529,7 +540,9 @@ pub(crate) enum DisabledReason {
     DevelopmentBuild,
     RuntimeEnvironment,
     Flag,
+    EnvironmentOptOut,
     Persisted,
+    NotOptedIn,
     CorruptSettings,
 }
 
@@ -539,7 +552,9 @@ impl DisabledReason {
             DisabledReason::DevelopmentBuild => "development build",
             DisabledReason::RuntimeEnvironment => "disabled by ORX_TELEMETRY_ENV",
             DisabledReason::Flag => "--no-telemetry flag",
+            DisabledReason::EnvironmentOptOut => "disabled by ORX_NO_TELEMETRY",
             DisabledReason::Persisted => "disabled via `orx telemetry off`",
+            DisabledReason::NotOptedIn => "not opted in (run `orx telemetry on` to enable)",
             DisabledReason::CorruptSettings => "settings file unreadable (failing safe)",
         }
     }
@@ -550,11 +565,12 @@ impl DisabledReason {
 /// state merely to decide whether they may send.
 /// `cli_flag` is the `--no-telemetry` global flag.
 ///
-/// User preference controls are intentionally minimal: the `--no-telemetry`
-/// flag and persistent `orx telemetry off`. `ORX_TELEMETRY_ENV` is a separate
-/// eligibility downgrade for testing official binaries. Automated/CI runs are
-/// not otherwise auto-disabled — the `ci` property on every event lets those
-/// be filtered at query time instead.
+/// Product telemetry is opt-in: the persisted preference must record `orx
+/// telemetry on`. On top of that, the `--no-telemetry` flag, a non-empty
+/// `ORX_NO_TELEMETRY`, and a persistent `orx telemetry off` each disable.
+/// `ORX_TELEMETRY_ENV` is a separate eligibility downgrade for testing
+/// official binaries. Automated/CI runs are not otherwise auto-disabled — the
+/// `ci` property on every event lets those be filtered at query time instead.
 fn environment_disabled_reason_for(
     build_channel: &str,
     runtime_environment: Option<&str>,
@@ -577,16 +593,30 @@ fn preference_disabled_reason(cli_flag: bool) -> Option<DisabledReason> {
     if cli_flag {
         return Some(DisabledReason::Flag);
     }
+    // The environment counterpart of the flag: a non-empty ORX_NO_TELEMETRY
+    // opts the whole run out (the agent-driven per-run opt-out).
+    if no_telemetry_env_set() {
+        return Some(DisabledReason::EnvironmentOptOut);
+    }
     // Persisted state is the only branch that reads disk.
     match read_settings_state() {
+        // A persisted opt-out (`orx telemetry off`) still wins over the opt-in.
         SettingsState::Loaded(s) if s.telemetry_disabled == Some(true) => {
             Some(DisabledReason::Persisted)
         }
+        // The explicit opt-in: `orx telemetry on` recorded consent.
+        SettingsState::Loaded(s) if s.telemetry_enabled == Some(true) => None,
+        // Opt-in default: every other state means the user never opted in.
+        SettingsState::Loaded(_) | SettingsState::Absent => Some(DisabledReason::NotOptedIn),
         // A present-but-unreadable file might hold an opt-out we can't parse;
         // fail safe (disabled) rather than track someone who may have opted out.
         SettingsState::Corrupt => Some(DisabledReason::CorruptSettings),
-        _ => None,
     }
+}
+
+/// Whether the `ORX_NO_TELEMETRY` opt-out is present as a non-empty value.
+fn no_telemetry_env_set() -> bool {
+    std::env::var_os("ORX_NO_TELEMETRY").is_some_and(|value| !value.is_empty())
 }
 
 pub(crate) fn disabled_reason(cli_flag: bool) -> Option<DisabledReason> {
@@ -606,13 +636,21 @@ fn is_enabled(cli_flag: bool) -> bool {
     disabled_reason(cli_flag).is_none()
 }
 
-/// Persist the opt-out flag (used by `orx telemetry on|off`). `true` writes
-/// `telemetry_disabled = Some(true)`; `false` clears it. Goes through the same
-/// lock as every other mutation so a concurrent install-id write can't clobber
-/// it. Returns the io result so the command can report a write failure.
+/// Persist the telemetry preference (used by `orx telemetry on|off`). `false`
+/// opts in: writes `telemetry_enabled = Some(true)` and clears any
+/// `telemetry_disabled`. `true` opts out: clears `telemetry_enabled` and writes
+/// `telemetry_disabled = Some(true)`. Goes through the same lock as every other
+/// mutation so a concurrent install-id write can't clobber it. Returns the io
+/// result so the command can report a write failure.
 pub(crate) fn set_persisted_disabled(disabled: bool) -> std::io::Result<()> {
     let result = mutate_settings(|s| {
-        s.telemetry_disabled = if disabled { Some(true) } else { None };
+        if disabled {
+            s.telemetry_enabled = None;
+            s.telemetry_disabled = Some(true);
+        } else {
+            s.telemetry_enabled = Some(true);
+            s.telemetry_disabled = None;
+        }
     });
     if result.is_ok() && disabled {
         cancel_pending();
@@ -972,9 +1010,14 @@ fn consent_payload(agreed: bool, distinct_id: &str, event_id: uuid::Uuid) -> ser
 }
 
 /// Record a telemetry toggle choice — `cli_telemetry_consent` with
-/// `{ agreed: bool }`. Within an eligible official build, this is the ONE event
-/// that ignores the user's telemetry preference: it must land even when the
-/// user chose to disable telemetry, otherwise off choices would be invisible.
+/// `{ agreed: bool }`. Within an eligible official build, the choice is the ONE
+/// event family that ignores the user's telemetry preference — but only where
+/// it carries information: an agree always lands (the user just opted in),
+/// while a decline lands only when the user had actually been opted in, so
+/// `orx telemetry off` from an install that never enabled telemetry sends
+/// nothing. Callers must record the consent BEFORE persisting the flip; both
+/// call sites (the `orx telemetry on|off` command and the `orx up` settings
+/// handler) do.
 ///
 /// Identity policy (phantom-free by construction):
 /// - `agreed` → the persistent install id. The user just consented to
@@ -988,7 +1031,7 @@ fn consent_payload(agreed: bool, distinct_id: &str, event_id: uuid::Uuid) -> ser
 /// the `orx telemetry on/off` command) can fire-and-confirm without hanging.
 /// Errors are swallowed — recording consent must never fail the action.
 pub(crate) async fn record_consent(agreed: bool) {
-    if environment_disabled_reason().is_some() {
+    if environment_disabled_reason().is_some() || !consent_is_observable(agreed) {
         return;
     }
     let event_id = uuid::Uuid::new_v4();
@@ -998,6 +1041,14 @@ pub(crate) async fn record_consent(agreed: bool) {
     // Cap the wait so the settings POST / command return promptly even if the
     // network is slow; the send itself also has its own 3s request timeout.
     let _ = tokio::time::timeout(Duration::from_secs(3), send).await;
+}
+
+/// The centralized consent rule for [`record_consent`]: an agree is always
+/// observable (the user is opting in right now), while a decline is only
+/// observable when the user was actually opted in at call time. Split out so
+/// the rule is unit-testable without a network send.
+fn consent_is_observable(agreed: bool) -> bool {
+    agreed || preference_enabled()
 }
 
 pub(crate) fn capture_onboarding_completed() {
@@ -1308,7 +1359,12 @@ mod tests {
         }
     }
 
-    const OPT_VARS: &[&str] = &["XDG_CONFIG_HOME", "ORX_TELEMETRY_ENV", "ORX_TELEMETRY_HOST"];
+    const OPT_VARS: &[&str] = &[
+        "XDG_CONFIG_HOME",
+        "ORX_NO_TELEMETRY",
+        "ORX_TELEMETRY_ENV",
+        "ORX_TELEMETRY_HOST",
+    ];
 
     #[test]
     fn environment_policy_is_fail_closed_and_downgrade_only() {
@@ -1341,7 +1397,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("orx-tel-persist-{}", uuid::Uuid::new_v4()));
         std::env::set_var("XDG_CONFIG_HOME", &dir);
 
-        assert!(preference_enabled());
+        // Opt-in default: a fresh install is not opted in.
+        assert!(matches!(
+            preference_disabled_reason(false),
+            Some(DisabledReason::NotOptedIn)
+        ));
+        assert!(!preference_enabled());
 
         // Persist an opt-out and confirm it disables.
         set_persisted_disabled(true).unwrap();
@@ -1350,15 +1411,41 @@ mod tests {
             Some(DisabledReason::Persisted)
         ));
         assert!(!preference_enabled());
+        assert_eq!(load_settings().and_then(|s| s.telemetry_enabled), None);
 
-        // Clearing it re-enables (and doesn't wipe the install id via the lock).
+        // Opting in flips the persisted preference (and doesn't wipe the
+        // install id via the lock).
         let _ = install_id();
         set_persisted_disabled(false).unwrap();
         assert!(preference_enabled());
+        assert_eq!(load_settings().and_then(|s| s.telemetry_enabled), Some(true));
+        assert!(load_settings().and_then(|s| s.telemetry_disabled).is_none());
         assert!(
             load_settings().and_then(|s| s.install_id).is_some(),
             "clearing opt-out must not clobber the install id"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn orx_no_telemetry_env_var_opts_out_non_empty_values_only() {
+        let _g = EnvGuard::new(OPT_VARS);
+        let dir = std::env::temp_dir().join(format!("orx-tel-envvar-{}", uuid::Uuid::new_v4()));
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+
+        std::env::set_var("ORX_NO_TELEMETRY", "1");
+        assert!(matches!(
+            preference_disabled_reason(false),
+            Some(DisabledReason::EnvironmentOptOut)
+        ));
+        // Even an explicit opt-in stays masked while the variable is set.
+        set_persisted_disabled(false).unwrap();
+        assert!(!preference_enabled());
+
+        // An empty value does not count as set; the opt-in applies again.
+        std::env::set_var("ORX_NO_TELEMETRY", "");
+        assert!(preference_enabled());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1793,6 +1880,30 @@ mod tests {
     }
 
     #[test]
+    fn consent_rule_only_reports_declines_from_enabled_installs() {
+        let _g = EnvGuard::new(OPT_VARS);
+        let dir =
+            std::env::temp_dir().join(format!("orx-tel-consent-rule-{}", uuid::Uuid::new_v4()));
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+
+        // A never-enabled install sends nothing on `off`.
+        assert!(!consent_is_observable(false));
+        // `on` always reports the agree, even from a not-yet-enabled install.
+        assert!(consent_is_observable(true));
+
+        // From an enabled install, `off` sends one observable decline — the
+        // callers run this check before persisting the flip.
+        set_persisted_disabled(false).unwrap();
+        assert!(consent_is_observable(false));
+
+        // A second `off` after the flip sends nothing (already opted out).
+        set_persisted_disabled(true).unwrap();
+        assert!(!consent_is_observable(false));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn first_action_claims_each_surface_once() {
         let _g = EnvGuard::new(OPT_VARS);
         let dir = std::env::temp_dir().join(format!("orx-tel-first-{}", uuid::Uuid::new_v4()));
@@ -1818,6 +1929,7 @@ mod tests {
         std::env::set_var("XDG_CONFIG_HOME", &dir);
         std::env::set_var("ORX_NO_TELEMETRY", "1");
 
+        // The env opt-out is live: a disabled run must not claim the slot.
         capture_first_action("project", "typed_prompt");
         assert!(
             load_settings()
