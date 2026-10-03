@@ -28,6 +28,13 @@ literature, develop hypotheses, run experiments, and produce research artifacts.
 
 </div>
 
+> [!NOTE]
+> **Security-hardened fork** of [alphaXiv/OpenResearch](https://github.com/alphaXiv/OpenResearch)
+> (MIT, upstream © its authors — see `LICENSE`). Defaults here are the conservative side of
+> upstream's: telemetry and auto-update are opt-in, installers are digest-verified, remote
+> text is framed as untrusted, and credentials do not fan out across compute backends. See
+> [SECURITY_FIXES.md](SECURITY_FIXES.md) for every change and the remaining known risks.
+
 ## Get started
 
 Install the CLI on macOS or Linux, then launch OpenResearch:
@@ -137,13 +144,15 @@ service-owned capabilities such as organizations and managed compute.
 
 ## Usage analytics
 
-Official release builds send opt-out, coarse usage events tied to a random
-installation ID. They do not include code, prompts, file contents or paths,
-repository names, tokens, emails, or project and experiment identifiers.
+Analytics are off by default. Once you opt in with `orx telemetry on`,
+official release builds send coarse usage events tied to a random installation
+ID. They do not include code, prompts, file contents or paths, repository
+names, tokens, emails, or project and experiment identifiers.
 
 ```sh
-orx telemetry off
 orx telemetry status
+orx telemetry on
+orx telemetry off
 orx <command> --no-telemetry
 ```
 
@@ -154,6 +163,6 @@ a bug, wish for a feature, or get frustrated with OpenResearch. Each report is
 a short description of the workflow problem. Bug reports include as much detail
 as possible to reproduce a failure while omitting sensitive information. Like
 analytics, reports are sent only from official release builds.
-They are linked to your account when you are logged in and turned off by
-`orx telemetry off`. The `--no-telemetry` flag covers only the command it is
+They are linked to your account when you are logged in and only sent while
+analytics are enabled. The `--no-telemetry` flag covers only the command it is
 passed to.
