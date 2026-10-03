@@ -1039,12 +1039,14 @@ mod tests {
         // can't silently drift.
         let t = SshTarget::host_port("root@h".into(), 2222, HostKeyPolicy::Ephemeral);
         let (head, known_hosts, tail) = (&t.extra_opts[..5], &t.extra_opts[5], &t.extra_opts[6..]);
-        assert_eq!(head, ["-p", "2222", "-o", "StrictHostKeyChecking=accept-new", "-o"]);
+        assert_eq!(
+            head,
+            ["-p", "2222", "-o", "StrictHostKeyChecking=accept-new", "-o"]
+        );
         assert_eq!(tail, ["-o", "LogLevel=ERROR"]);
         // By shape: it follows XDG_CONFIG_HOME, which telemetry tests mutate.
         assert!(
-            known_hosts.starts_with("UserKnownHostsFile=")
-                && known_hosts.ends_with("known_hosts"),
+            known_hosts.starts_with("UserKnownHostsFile=") && known_hosts.ends_with("known_hosts"),
             "{known_hosts}"
         );
     }

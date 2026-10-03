@@ -187,8 +187,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// Extracts the sha256 digest GitHub's API records for `asset` from a
 /// `releases/tags/<tag>` response body. Pure, so a fixture can pin it.
 fn asset_digest_from_release(body: &str, asset: &str) -> Result<String> {
-    let release: GithubRelease =
-        serde_json::from_str(body).map_err(|e| anyhow!("Could not parse the GitHub release response: {e}"))?;
+    let release: GithubRelease = serde_json::from_str(body)
+        .map_err(|e| anyhow!("Could not parse the GitHub release response: {e}"))?;
     let digest = release
         .assets
         .iter()
@@ -1548,7 +1548,7 @@ impl UpdateWarning {
 #[cfg(test)]
 mod tests {
     use super::{
-        app_bundle_root, attempt_backoff, attempt_due, asset_digest_from_release, bold,
+        app_bundle_root, asset_digest_from_release, attempt_backoff, attempt_due, bold,
         detect_channel, exe_matches_prefix, now_unix, package_manager_owns, parse_manifest,
         portable_dir, portable_outside_prefix, precedence, relaunch_args, render, retired_path,
         sha256_hex, warning_for, CheckCache, InstallChannel, ATTEMPT_BACKOFF_MAX,

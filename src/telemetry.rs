@@ -1418,7 +1418,10 @@ mod tests {
         let _ = install_id();
         set_persisted_disabled(false).unwrap();
         assert!(preference_enabled());
-        assert_eq!(load_settings().and_then(|s| s.telemetry_enabled), Some(true));
+        assert_eq!(
+            load_settings().and_then(|s| s.telemetry_enabled),
+            Some(true)
+        );
         assert!(load_settings().and_then(|s| s.telemetry_disabled).is_none());
         assert!(
             load_settings().and_then(|s| s.install_id).is_some(),

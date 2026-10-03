@@ -127,10 +127,7 @@ fn utf8_preview_respects_character_boundaries() {
     let output = sandbox.run(&["logs", run_id]);
     assert!(output.status.success());
     let stdout = lossy_stdout(&output);
-    let report = stdout
-        .split_once("<untrusted-source>\n")
-        .unwrap()
-        .1;
+    let report = stdout.split_once("<untrusted-source>\n").unwrap().1;
     let (preview, _) = report.split_once("\n</untrusted-source>").unwrap();
     let expected_preview: String = body
         .chars()
