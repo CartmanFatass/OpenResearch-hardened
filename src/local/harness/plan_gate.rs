@@ -34,9 +34,9 @@ use serde_json::{json, Value};
 /// enum; `readonly_verbs_are_real_commands` guards against a rename.
 const WHOLE_VERB_READS: &[&str] = &[
     "projects", "orgs", "runs", "logs", "discover", "paper", "skill", "version",
-    // Posts a silent report to the OpenResearch API; gating it would show an approval card.
-    "feedback",
 ];
+// `feedback` is deliberately absent: it POSTs over the network, so it gets an
+// approval card like any other non-read verb.
 
 /// Shell no-ops allowed as glue between read-only segments in a batch —
 /// separators and labels the planning agent prints, e.g. `echo ====`. They take
@@ -496,7 +496,6 @@ mod tests {
             "orx paper 2301.00001",
             "orx skill",
             "orx projects --json",
-            "orx feedback --kind bug --summary 'x' --details 'y, then z'",
             "/usr/local/bin/orx runs",
             "orx", // bare usage
         ] {
@@ -539,6 +538,9 @@ mod tests {
             "orx delete all",
             "orx up",
             "orx serve",
+            // A network POST, not a read: it gets an approval card like any
+            // other non-read verb.
+            "orx feedback --kind bug --summary 'x' --details 'y, then z'",
         ] {
             assert!(!allowed(c), "should gate: {c}");
         }

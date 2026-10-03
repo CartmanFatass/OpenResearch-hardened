@@ -151,6 +151,100 @@ pub async fn fetch_release_asset(tag: &str, asset: &str, timeout: Duration) -> R
 }
 
 // ---------------------------------------------------------------------------
+// Installer integrity (GitHub release asset digests)
+// ---------------------------------------------------------------------------
+
+/// One release asset as GitHub's REST API describes it. Only the fields the
+/// update path needs are declared; unknown fields are ignored.
+#[derive(Deserialize)]
+struct GithubReleaseAsset {
+    name: String,
+    #[serde(default)]
+    digest: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GithubRelease {
+    #[serde(default)]
+    assets: Vec<GithubReleaseAsset>,
+}
+
+/// `https://github.com/o/r` → `https://api.github.com/repos/o/r`.
+fn api_repos_url() -> Result<String> {
+    let repo = REPO_URL
+        .strip_prefix("https://github.com/")
+        .ok_or_else(|| anyhow!("unsupported REPO_URL: {REPO_URL}"))?;
+    Ok(format!("https://api.github.com/repos/{repo}"))
+}
+
+/// The sha256 of `bytes` as lowercase hex — the format of an asset's `digest`
+/// field once its `sha256:` prefix is stripped.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Extracts the sha256 digest GitHub's API records for `asset` from a
+/// `releases/tags/<tag>` response body. Pure, so a fixture can pin it.
+fn asset_digest_from_release(body: &str, asset: &str) -> Result<String> {
+    let release: GithubRelease =
+        serde_json::from_str(body).map_err(|e| anyhow!("Could not parse the GitHub release response: {e}"))?;
+    let digest = release
+        .assets
+        .iter()
+        .find(|a| a.name == asset)
+        .and_then(|a| a.digest.as_deref())
+        .ok_or_else(|| anyhow!("GitHub lists no sha256 digest for {asset}"))?;
+    digest
+        .strip_prefix("sha256:")
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("Unrecognized digest format for {asset}: {digest}"))
+}
+
+/// Verifies downloaded installer bytes against the sha256 digest GitHub's REST
+/// API publishes for that release asset. The release itself publishes no
+/// checksum for the installer scripts — no `checksum` in the manifest's
+/// installer artifacts, no `.sha256` sidecar, absent from `sha256.sum` — so
+/// the API digest is the only published integrity source for them. Runs once
+/// per actual update (never on the per-command check, which stays on the
+/// rate-limit-free CDN permalink), so the unauthenticated 60/hour API limit
+/// is not a concern. Fails closed: an unreachable API, a missing digest, or
+/// a mismatch aborts the update — an unverified installer must never run.
+pub async fn verify_installer_digest(
+    tag: &str,
+    asset: &str,
+    bytes: &[u8],
+    timeout: Duration,
+) -> Result<()> {
+    let url = format!("{}/releases/tags/{}", api_repos_url()?, tag);
+    let res = http()
+        .get(&url)
+        .header("user-agent", UA)
+        .header("accept", "application/vnd.github+json")
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(|e| anyhow!("Could not fetch GitHub's asset digests for {tag}: {e}"))?;
+    let status = res.status();
+    if !status.is_success() {
+        let reason = status.canonical_reason().unwrap_or("");
+        return Err(anyhow!(
+            "GitHub release request for {tag} failed ({} {}) — refusing to run an unverified installer",
+            status.as_u16(),
+            reason
+        ));
+    }
+    let expected = asset_digest_from_release(&res.text().await?, asset)?;
+    let actual = sha256_hex(bytes);
+    if !actual.eq_ignore_ascii_case(&expected) {
+        return Err(anyhow!(
+            "sha256 mismatch for {asset}: the downloaded installer does not match GitHub's digest; update aborted"
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Install receipt (written by the cargo-dist shell installer)
 // ---------------------------------------------------------------------------
 
@@ -1454,15 +1548,54 @@ impl UpdateWarning {
 #[cfg(test)]
 mod tests {
     use super::{
-        app_bundle_root, attempt_backoff, attempt_due, bold, detect_channel, exe_matches_prefix,
-        now_unix, package_manager_owns, parse_manifest, portable_dir, portable_outside_prefix,
-        precedence, relaunch_args, render, retired_path, warning_for, CheckCache, InstallChannel,
-        ATTEMPT_BACKOFF_MAX, ATTEMPT_BACKOFF_MIN,
+        app_bundle_root, attempt_backoff, attempt_due, asset_digest_from_release, bold,
+        detect_channel, exe_matches_prefix, now_unix, package_manager_owns, parse_manifest,
+        portable_dir, portable_outside_prefix, precedence, relaunch_args, render, retired_path,
+        sha256_hex, warning_for, CheckCache, InstallChannel, ATTEMPT_BACKOFF_MAX,
+        ATTEMPT_BACKOFF_MIN,
     };
     use semver::Version;
     use std::ffi::OsString;
     use std::path::Path;
     use std::path::PathBuf;
+
+    #[test]
+    fn sha256_hex_matches_known_vector() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn installer_digest_extraction_parses_and_fails_closed() {
+        // Shaped like a real GET /repos/{owner}/{repo}/releases/tags/{tag}
+        // response; unknown fields must be ignored, missing digests tolerated.
+        let body = r#"{"tag_name":"v0.2.15","assets":[
+            {"name":"openresearch-cli-installer.ps1",
+             "digest":"sha256:49ee79f8856ff1a7f3e588a387c8568c9161b1d7e51a8d2f4942edf9ef0304e5"},
+            {"name":"openresearch-cli-installer.sh",
+             "digest":"sha256:0f80ed85497023fb909c73bda301e4f0eda5e3eb09b20471c7a0cb54565c1286"},
+            {"name":"readme.txt"}
+        ]}"#;
+        assert_eq!(
+            asset_digest_from_release(body, "openresearch-cli-installer.ps1").unwrap(),
+            "49ee79f8856ff1a7f3e588a387c8568c9161b1d7e51a8d2f4942edf9ef0304e5"
+        );
+        assert_eq!(
+            asset_digest_from_release(body, "openresearch-cli-installer.sh").unwrap(),
+            "0f80ed85497023fb909c73bda301e4f0eda5e3eb09b20471c7a0cb54565c1286"
+        );
+        // An asset with no digest fails closed rather than skipping verification.
+        assert!(asset_digest_from_release(body, "readme.txt").is_err());
+        // An asset the release does not list at all.
+        assert!(asset_digest_from_release(body, "missing.txt").is_err());
+        // A digest in an unrecognized format is refused, not passed through.
+        let other = r#"{"assets":[{"name":"a.sh","digest":"sha512:abcdef"}]}"#;
+        assert!(asset_digest_from_release(other, "a.sh").is_err());
+        // A body that is not JSON at all.
+        assert!(asset_digest_from_release("<html>rate limited</html>", "a.sh").is_err());
+    }
 
     #[test]
     fn render_sets_off_the_warning_in_its_own_block() {

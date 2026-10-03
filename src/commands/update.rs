@@ -4,12 +4,26 @@
 //! The mechanism mirrors what axoupdater (uv's `self update`) does: download
 //! the `openresearch-cli-installer.sh` asset from the target release and run
 //! it pinned to the existing install prefix via `CARGO_DIST_FORCE_INSTALL_DIR`.
-//! The installer owns the hard parts — checksum verification and the atomic
-//! rename into `~/.cargo/bin` (never an in-place overwrite, which on macOS
-//! trips the kernel's per-inode code-signature cache and SIGKILLs the binary).
-//! Windows runs the `.ps1` twin of that installer, which unpacks but does not
-//! verify checksums, into a staging directory, then swaps the binary in itself
-//! since Windows will not overwrite a running exe; see `updates::windows`.
+//! The installer owns the atomic rename into `~/.cargo/bin` (never an in-place
+//! overwrite, which on macOS trips the kernel's per-inode code-signature cache
+//! and SIGKILLs the binary), and on Unix it also verifies the artifact it
+//! unpacks against the sha256 values embedded in the script (skipped where
+//! `sha256sum` is unavailable). Windows runs the `.ps1` twin of that installer,
+//! which unpacks the artifact without verifying it, into a staging directory,
+//! then swaps the binary in itself since Windows will not overwrite a running
+//! exe; see `updates::windows`.
+//!
+//! The release publishes no checksum file for the installer scripts
+//! themselves — the manifest's installer artifacts carry no `checksum`
+//! field, there is no `.sha256` sidecar, and `sha256.sum` lists only the
+//! binary artifacts — so `apply` verifies the downloaded script against the
+//! sha256 digest GitHub's REST API records for the asset and refuses to run
+//! anything the digest does not vouch for (see
+//! `updates::verify_installer_digest`). On Unix the verified installer then
+//! also checks the artifact it unpacks against the sha256 values embedded in
+//! the script; on Windows the `.ps1` embeds none, so the script-level digest
+//! plus the HTTPS download pinned to the release tag are that path's
+//! integrity controls.
 //!
 //! Guards, in order:
 //!   - `OPENRESEARCH_CLI_DISABLE_UPDATE=1` refuses outright (same switch the
@@ -132,10 +146,20 @@ async fn apply(args: crate::UpdateArgs) -> Result<Outcome> {
 
     // Pin the installer to the same release the manifest described, so the
     // version we report is exactly the version that gets installed.
-    let installer = updates::fetch_release_asset(
+    let installer_asset = format!("{}-installer.{}", updates::APP_NAME, INSTALLER_EXT);
+    let installer =
+        updates::fetch_release_asset(&latest.tag, &installer_asset, Duration::from_secs(60))
+            .await?;
+    // The installer script is the one update asset the release publishes no
+    // checksum file for, so verify it against the sha256 digest GitHub's API
+    // records for the asset before anything runs it — fail closed, so an
+    // unreachable API or a mismatch aborts the update instead of executing
+    // unverified bytes.
+    updates::verify_installer_digest(
         &latest.tag,
-        &format!("{}-installer.{}", updates::APP_NAME, INSTALLER_EXT),
-        Duration::from_secs(60),
+        &installer_asset,
+        &installer,
+        Duration::from_secs(15),
     )
     .await?;
     run_installer(&target, &installer, args.background)?;
