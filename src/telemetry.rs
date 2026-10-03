@@ -14,9 +14,10 @@
 //!   on` (also toggleable from `orx up`); a `--no-telemetry` flag, a non-empty
 //!   `ORX_NO_TELEMETRY`, or a persistent `orx telemetry off` disables it again.
 //!   Disabled product telemetry sends nothing and generates no install id. The
-//!   telemetry choice itself is the partial exception: the agree is always
-//!   recorded, and a decline lands only for an install that had actually been
-//!   opted in; see `record_consent`.
+//!   telemetry choice itself is the partial exception to the persisted setting:
+//!   an agree is recorded, and a decline lands only for an install that had
+//!   actually been opted in. Per-run opt-outs suppress consent too; see
+//!   `record_consent`.
 //! - **Never blocks or crashes the CLI.** Events enter a disk-backed outbox,
 //!   then send on a background task with a bounded flush window. Failed sends
 //!   retry on the next run; telemetry errors never enter a command's `?` chain.
@@ -589,7 +590,8 @@ fn environment_disabled_reason() -> Option<DisabledReason> {
     environment_disabled_reason_for(build_channel(), runtime_environment.as_deref())
 }
 
-fn preference_disabled_reason(cli_flag: bool) -> Option<DisabledReason> {
+/// Per-run switches apply to every analytics transmission, including consent.
+fn per_run_disabled_reason(cli_flag: bool) -> Option<DisabledReason> {
     if cli_flag {
         return Some(DisabledReason::Flag);
     }
@@ -597,6 +599,13 @@ fn preference_disabled_reason(cli_flag: bool) -> Option<DisabledReason> {
     // opts the whole run out (the agent-driven per-run opt-out).
     if no_telemetry_env_set() {
         return Some(DisabledReason::EnvironmentOptOut);
+    }
+    None
+}
+
+fn preference_disabled_reason(cli_flag: bool) -> Option<DisabledReason> {
+    if let Some(reason) = per_run_disabled_reason(cli_flag) {
+        return Some(reason);
     }
     // Persisted state is the only branch that reads disk.
     match read_settings_state() {
@@ -808,6 +817,11 @@ async fn deliver_payload(path: Option<PathBuf>, payload: serde_json::Value) {
 }
 
 async fn deliver_queued_payload(path: Option<PathBuf>, payload: serde_json::Value) {
+    // Consent can bypass a persisted opt-out, never a run-wide opt-out. Check
+    // again at the send boundary so a queued retry cannot bypass the switch.
+    if per_run_disabled_reason(flag()).is_some() {
+        return;
+    }
     if post_payload(&payload).await != DeliveryOutcome::Retryable {
         if let Some(path) = path {
             let _ = std::fs::remove_file(path);
@@ -890,7 +904,7 @@ fn transfer_pending_events() {
 }
 
 pub(crate) fn retry_outbox() {
-    if environment_disabled_reason().is_some() {
+    if environment_disabled_reason().is_some() || per_run_disabled_reason(flag()).is_some() {
         return;
     }
     transfer_pending_events();
@@ -1012,12 +1026,14 @@ fn consent_payload(agreed: bool, distinct_id: &str, event_id: uuid::Uuid) -> ser
 /// Record a telemetry toggle choice — `cli_telemetry_consent` with
 /// `{ agreed: bool }`. Within an eligible official build, the choice is the ONE
 /// event family that ignores the user's telemetry preference — but only where
-/// it carries information: an agree always lands (the user just opted in),
+/// it carries information: an agree lands (the user just opted in),
 /// while a decline lands only when the user had actually been opted in, so
 /// `orx telemetry off` from an install that never enabled telemetry sends
 /// nothing. Callers must record the consent BEFORE persisting the flip; both
 /// call sites (the `orx telemetry on|off` command and the `orx up` settings
 /// handler) do.
+/// The `--no-telemetry` flag and `ORX_NO_TELEMETRY` suppress even consent,
+/// without generating an installation ID or queuing a later transmission.
 ///
 /// Identity policy (phantom-free by construction):
 /// - `agreed` → the persistent install id. The user just consented to
@@ -1043,12 +1059,12 @@ pub(crate) async fn record_consent(agreed: bool) {
     let _ = tokio::time::timeout(Duration::from_secs(3), send).await;
 }
 
-/// The centralized consent rule for [`record_consent`]: an agree is always
-/// observable (the user is opting in right now), while a decline is only
-/// observable when the user was actually opted in at call time. Split out so
-/// the rule is unit-testable without a network send.
+/// The centralized consent rule for [`record_consent`]: absent a per-run
+/// opt-out, an agree is observable (the user is opting in right now), while a
+/// decline is only observable when the user was actually opted in at call
+/// time. Split out so the rule is unit-testable without a network send.
 fn consent_is_observable(agreed: bool) -> bool {
-    agreed || preference_enabled()
+    per_run_disabled_reason(flag()).is_none() && (agreed || preference_enabled())
 }
 
 pub(crate) fn capture_onboarding_completed() {
@@ -1907,6 +1923,14 @@ mod tests {
     }
 
     #[test]
+    fn consent_rule_respects_environment_opt_out() {
+        let _g = EnvGuard::new(OPT_VARS);
+        std::env::set_var("ORX_NO_TELEMETRY", "1");
+        assert!(!consent_is_observable(true));
+        assert!(!consent_is_observable(false));
+    }
+
+    #[test]
     fn first_action_claims_each_surface_once() {
         let _g = EnvGuard::new(OPT_VARS);
         let dir = std::env::temp_dir().join(format!("orx-tel-first-{}", uuid::Uuid::new_v4()));
@@ -2165,6 +2189,62 @@ mod tests {
         assert!(!consent_path.exists());
 
         server.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn consent_retry_respects_environment_opt_out() {
+        use tokio::io::AsyncWriteExt;
+
+        let _g = EnvGuard::new(OPT_VARS);
+        let dir =
+            std::env::temp_dir().join(format!("orx-tel-consent-disabled-{}", uuid::Uuid::new_v4()));
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        std::env::set_var("ORX_NO_TELEMETRY", "1");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        std::env::set_var(
+            "ORX_TELEMETRY_HOST",
+            format!("http://{}", listener.local_addr().unwrap()),
+        );
+        let server = tokio::spawn(async move {
+            let accepted =
+                tokio::time::timeout(Duration::from_millis(250), listener.accept()).await;
+            let Ok(Ok((mut stream, _))) = accepted else {
+                return false;
+            };
+            drain_request(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            true
+        });
+        std::fs::create_dir_all(outbox_dir()).unwrap();
+        let path = outbox_dir().join("consent.json");
+        let consent = build_payload(
+            "telemetry_consent",
+            CONSENT_SENTINEL_ID,
+            json!({ "agreed": false }),
+        );
+        std::fs::write(&path, serde_json::to_vec(&consent).unwrap()).unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            deliver_retry_payload(path.clone(), consent),
+        )
+        .await
+        .unwrap();
+        let contacted = tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!contacted, "per-run opt-out must block even queued consent");
+        assert!(
+            path.exists(),
+            "a disabled run must not acknowledge the event"
+        );
+        assert!(load_settings().and_then(|s| s.install_id).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

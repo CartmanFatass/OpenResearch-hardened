@@ -1,42 +1,23 @@
-//! Claude plan-mode gate for read-only shell commands.
+//! Conservative plan-mode auto-approval for a small set of inspection commands.
 //!
-//! Claude Code's `--permission-mode plan` auto-approves its built-in read-only
-//! tools (file reads, `grep`, …) but treats an arbitrary `Bash(orx …)` as a
-//! write it must gate — and headless `--print` can't answer that prompt, so the
-//! call just fails. That breaks planning, because the agent plans by
-//! *inspecting* prior runs and logs via read-only `orx`
-//! subcommands — and by reading experiment code that often lives only on git
-//! branches (`git show <ref>:<file>`, `git ls-tree`), typically piped through
-//! `head`/`grep` with a `2>&1`.
-//!
-//! The fix is a `PreToolUse` hook (wired only in plan mode — see
-//! `claude::write_plan_settings`) that runs `orx plan-gate`: it reads the hook's
-//! JSON off stdin, and if the tool is a Bash call invoking a *read-only*
-//! command it prints an `"allow"` decision so the command runs. For anything
-//! else — a write/launch `orx` verb (`exp run`, `instance`, `create-*`, …), a
-//! git write, an unknown program, or an unparseable command — it stays silent
-//! (exit 0, no stdout), so plan mode's normal gating applies and launches
-//! remain blocked until the user approves the plan.
-//!
-//! Classification is deliberately *allowlist-only*: an unknown or ambiguous
-//! command is treated as NOT read-only (gated), so a newly added write verb
-//! can never leak through by default. The flip side is a maintenance
-//! obligation: the `orx` allowlist is a hand-kept mirror of the read-only
-//! verbs in `main.rs`'s `Command` enum. A newly added *read* verb stays gated
-//! until it's added here — `readonly_verbs_are_real_commands` guards against a
-//! rename silently un-gating nothing, but adding a new read verb is a manual
-//! step (there's a pointer comment on the `Command` enum).
+//! The classifier accepts only literal shell words, simple pipelines and batches.
+//! Anything dynamic, unknown or potentially writing defers to the normal approval
+//! flow. This is an approval shortcut, not an OS sandbox: the shell environment
+//! and installed executables must still be trusted. In particular, Git commands
+//! require approval because repository/user configuration can execute programs
+//! even during a nominal read (fsmonitor, textconv, pagers and remote helpers).
 
 use serde_json::{json, Value};
 
 /// Top-level `orx` verbs that never change the project in any form (no
 /// subcommand can turn them into a write). Kept in lockstep with `main.rs`'s `Command`
 /// enum; `readonly_verbs_are_real_commands` guards against a rename.
+#[cfg(test)]
 const WHOLE_VERB_READS: &[&str] = &[
     "projects", "orgs", "runs", "logs", "discover", "paper", "skill", "version",
 ];
-// `feedback` is deliberately absent: it POSTs over the network, so it gets an
-// approval card like any other non-read verb.
+// `feedback` is deliberately absent: it POSTs over the network and follows the
+// normal permission flow instead of being auto-approved by this plan gate.
 
 /// Shell no-ops allowed as glue between read-only segments in a batch —
 /// separators and labels the planning agent prints, e.g. `echo ====`. They take
@@ -44,42 +25,11 @@ const WHOLE_VERB_READS: &[&str] = &[
 /// are rejected before we get this far), so a program-name match is enough.
 const READONLY_GLUE: &[&str] = &["echo", "true", ":"];
 
-/// Programs a read-only producer may pipe into: pure stream consumers that
-/// never write without a redirect (and redirects are rejected per-token).
-/// Deliberately excluded: `tee` (writes files), `xargs` (spawns commands),
-/// `sed`/`awk` (in-place edits, `w`/`system()` escape hatches).
+/// Stream tools with no supported file-output or command-execution mode.
+/// `sort` and `uniq` are deliberately excluded: both accept an output file, and
+/// `sort --compress-program` can execute a helper. Git is not auto-approved.
 const PURE_CONSUMERS: &[&str] = &[
-    "head", "tail", "grep", "egrep", "fgrep", "wc", "cat", "sort", "uniq", "cut", "tr", "nl",
-    "column",
-];
-
-/// `git` verbs that are read-only in every arg form, subject to the argument
-/// guards in [`is_readonly_git`] (`--output` writes a file from `log`/`show`/
-/// `diff`; `-O`/`--open-files-in-pager` executes a pager from `grep`).
-/// Verbs with mixed read/write forms (`branch`, `tag`, `stash`, `remote`,
-/// `worktree`, `reflog`) are handled conditionally; `config` is excluded
-/// entirely (its read/write grammar is too fiddly to classify safely).
-const GIT_WHOLE_VERB_READS: &[&str] = &[
-    "status",
-    "log",
-    "show",
-    "diff",
-    "grep",
-    "ls-tree",
-    "ls-files",
-    "rev-parse",
-    "rev-list",
-    "cat-file",
-    "blame",
-    "shortlog",
-    "describe",
-    "name-rev",
-    "merge-base",
-    "show-ref",
-    "for-each-ref",
-    "count-objects",
-    "diff-tree",
-    "whatchanged",
+    "head", "tail", "grep", "egrep", "fgrep", "wc", "cat", "cut", "tr", "nl", "column",
 ];
 
 /// Decide whether a `PreToolUse` hook payload describes a read-only command
@@ -133,46 +83,22 @@ pub fn decide(payload: &Value) -> Option<Value> {
     }))
 }
 
-/// True iff `command` is a read-only inspection that plan mode may run.
-///
-/// A single read-only invocation (`orx <read-verb>`, `git <read-verb>`, a pure
-/// consumer, or glue) is allowed. So is a *sequence* of them joined by `;` or
-/// `&&` — the batching the planning agent uses to fetch several nodes in one
-/// call, e.g. `orx exp desc A; echo ====; orx exp desc B` — and a *pipeline*
-/// whose first stage is a read-only producer and every later stage a pure
-/// consumer, e.g. `git log --oneline | head -20` or `orx runs 2>&1 | grep err`.
-/// The whole line is allowed only if **every** segment and **every** pipeline
-/// stage independently passes; one unknown or write stage gates the entire
-/// command (allowlist-only). This keeps the security property: a read-only
-/// prefix can never smuggle a write through as a later segment or stage.
-///
-/// Only `;` and `&&` are recognized as separators and `|` as a pipe.
-/// Redirection (`>`/`<`), backticks, `$(…)`, background `&`, and newlines are
-/// rejected — with one carve-out: a standalone `2>&1` token (stderr-merge into
-/// the pipe) is dropped before the check, since agents habitually write
-/// `cmd 2>&1 | head` and the merge itself has no side effect.
-///
-/// The split is not quote-aware, so a separator *inside* a quoted argument
-/// (e.g. `orx logs "name && status"`) is still treated as a separator
-/// and gates the line. This over-gates rather than under-allows — it fails
-/// safe — so such a command just falls back to plan mode's normal gate; run it
-/// outside a batch to have it auto-allowed.
-///
-/// `pub` because the MCP permission bridge reuses the same classifier for its
-/// auto-allow policy.
+/// Auto-approve only literal, individually read-only commands. The separator
+/// split is intentionally conservative: separators inside quotes may defer a
+/// safe command, but each resulting stage must have balanced quotes. The word
+/// tokenizer removes literal quoting before option classification and rejects
+/// shell expansion, so quotes cannot conceal a writing option.
 pub fn command_is_readonly(command: &str) -> bool {
-    let command = command.trim();
-
-    // Metacharacters no per-stage scan can make safe: command substitution can
-    // run anything even inside an argument, `<` reads arbitrary files into a
-    // command we didn't classify, and multi-line scripts defeat the splitter.
-    if command.contains(['`', '<', '\n']) || command.contains("$(") {
+    // Bash does not split on all Unicode whitespace. Reject controls and
+    // non-shell whitespace rather than interpreting a different argument list.
+    if command
+        .chars()
+        .any(|c| (c.is_control() || c.is_whitespace()) && !matches!(c, ' ' | '\t'))
+    {
         return false;
     }
-
-    // Split on the two sequencing separators. Splitting on `&&` first, then `;`,
-    // yields the individual segments; each must stand on its own as read-only.
     command
+        .trim_matches([' ', '\t'])
         .split("&&")
         .flat_map(|part| part.split(';'))
         .all(is_readonly_segment)
@@ -181,7 +107,7 @@ pub fn command_is_readonly(command: &str) -> bool {
 /// True iff a single command segment (no `;`/`&&` separators) is a read-only
 /// pipeline: a read-only producer optionally piped through pure consumers.
 /// Empty/whitespace segments (from a leading/trailing/doubled separator) are
-/// shell no-ops and allowed, matching the shell's own tolerance for `orx runs;`.
+/// shell no-ops and allowed, matching the shell's own tolerance for `orx runs p-1;`.
 fn is_readonly_segment(segment: &str) -> bool {
     let segment = segment.trim();
     if segment.is_empty() {
@@ -202,245 +128,169 @@ fn is_readonly_segment(segment: &str) -> bool {
     })
 }
 
-/// Tokenize one pipeline stage. Drops standalone `2>&1` tokens (a harmless
-/// stderr-merge), then rejects the stage (`None`) if any remaining token still
-/// carries `>` or `&` — the segment split consumed every `&&`, so a surviving
-/// `&` is background execution or a malformed `&&&`, and any `>` is
-/// redirection.
-fn stage_tokens(stage: &str) -> Option<Vec<&str>> {
+/// Parse a deliberately small shell subset: literal words and single/double
+/// quoting only. No expansion, escapes outside single quotes, comments, globs,
+/// grouping or redirection. A standalone, unquoted `2>&1` is the sole exception.
+/// This is not a general shell parser; unsupported syntax requires approval.
+fn stage_tokens(stage: &str) -> Option<Vec<String>> {
+    let chars: Vec<char> = stage.chars().collect();
     let mut tokens = Vec::new();
-    for token in stage.split_whitespace() {
-        if token == "2>&1" {
+    let mut word = String::new();
+    let mut started = false;
+    let mut quote = None;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if let Some(delimiter) = quote {
+            if c == delimiter {
+                quote = None;
+            } else {
+                // Single quotes are entirely literal. Double quotes still
+                // expand these characters in Bash, so defer those forms.
+                if delimiter == '"' && matches!(c, '$' | '`' | '\\') {
+                    return None;
+                }
+                word.push(c);
+            }
+        } else if matches!(c, ' ' | '\t') {
+            if started {
+                tokens.push(std::mem::take(&mut word));
+                started = false;
+            }
+        } else if !started
+            && chars[i..].starts_with(&['2', '>', '&', '1'])
+            && chars.get(i + 4).is_none_or(|c| matches!(c, ' ' | '\t'))
+        {
+            i += 4;
             continue;
+        } else if matches!(c, '\'' | '"') {
+            quote = Some(c);
+            started = true;
+        } else {
+            if matches!(
+                c,
+                '$' | '`'
+                    | '\\'
+                    | '<'
+                    | '>'
+                    | '&'
+                    | '('
+                    | ')'
+                    | '{'
+                    | '}'
+                    | '['
+                    | ']'
+                    | '*'
+                    | '?'
+                    | '~'
+                    | '#'
+                    | '!'
+            ) {
+                return None;
+            }
+            word.push(c);
+            started = true;
         }
-        if token.contains(['>', '&']) {
-            return None;
-        }
-        tokens.push(token);
+        i += 1;
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if started {
+        tokens.push(word);
     }
     Some(tokens)
 }
 
 /// True iff a pipeline's first stage is read-only: glue, a read-only `orx`
-/// invocation, a read-only `git` invocation, or a pure consumer (so `wc -l f`
+/// invocation, or a pure consumer (so `wc -l f`
 /// or `head -50 f` stand alone too).
 fn is_readonly_producer(stage: &str) -> bool {
     let Some(tokens) = stage_tokens(stage) else {
         return false;
     };
-    // The program is the first token. Reject a leading env-assignment or any
-    // unlisted program.
-    let Some(&program) = tokens.first() else {
-        return false; // empty first stage: `| head` — not a real pipeline
+    let Some(program) = tokens.first().map(String::as_str) else {
+        return false;
     };
     if READONLY_GLUE.contains(&program) {
         return true;
     }
-    if program == "orx" || program.ends_with("/orx") {
-        return is_readonly_orx(&tokens, stage);
-    }
-    if program == "git" || program.ends_with("/git") {
-        return is_readonly_git(&tokens);
+    // A matching basename is not identity: /tmp/untrusted/orx could do anything.
+    // The plain name is the app-provided PATH entry; explicit paths must name
+    // this running executable, not merely end in /orx.
+    if program == "orx"
+        || crate::paths::spawnable_exe().is_ok_and(|path| path == std::path::Path::new(program))
+    {
+        return is_readonly_orx(&tokens);
     }
     is_pure_consumer(&tokens)
 }
 
-/// True iff the stage runs one of the [`PURE_CONSUMERS`]. Args are arbitrary:
-/// redirection/substitution/background were already rejected per-token, and
-/// none of these programs writes without a redirect.
-fn is_pure_consumer(tokens: &[&str]) -> bool {
-    match tokens.first() {
-        Some(program) => PURE_CONSUMERS.contains(program),
-        None => false,
-    }
+fn is_pure_consumer(tokens: &[String]) -> bool {
+    tokens
+        .first()
+        .is_some_and(|program| PURE_CONSUMERS.contains(&program.as_str()))
 }
 
-/// True iff a tokenized `orx …` invocation is read-only. `stage` is the raw
-/// stage text, kept for the `--set`/`--stdin` substring scan (those flags only
-/// appear on the write form of `exp desc`, so a whole-stage
-/// scan is a sound discriminator).
-fn is_readonly_orx(tokens: &[&str], stage: &str) -> bool {
-    let mut rest = tokens.iter().skip(1).copied();
+/// Parse normalized literal argv using the actual CLI grammar. In particular,
+/// `--s''et` is already `--set` here, and is classified as a write. Future
+/// commands and invalid argument combinations fail closed.
+fn is_readonly_orx(tokens: &[String]) -> bool {
+    use crate::commands::compute::{ComputeCommand, InstructionsCommand, SshConfigCommand};
+    use crate::{Command, ComputeArgs, ExpArgs, ExpCommand, ProjectArgs, ProjectCommand};
+    use clap::Parser;
 
-    // First non-flag token after the binary is the top-level verb.
-    let Some(verb) = subcommand(&mut rest) else {
-        // Bare `orx` (or only flags): prints usage — harmless and read-only.
-        return true;
+    let command = match crate::Cli::try_parse_from(tokens) {
+        Ok(cli) => cli.command,
+        Err(error) => {
+            return matches!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            );
+        }
     };
-
-    if WHOLE_VERB_READS.contains(&verb) {
-        // No subcommand can turn these into a write.
-        return true;
-    }
-
-    match verb {
-        "compute" => {
-            use crate::commands::compute::{ComputeCommand, InstructionsCommand, SshConfigCommand};
-            use clap::Parser;
-            let parsed = crate::Cli::try_parse_from(tokens).map(|cli| cli.command);
-            (stage
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '\t' | '-' | '_'))
-                && matches!(
-                    &parsed,
-                    Err(error) if matches!(error.kind(), clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion)
-                ))
-                || matches!(
-                    parsed,
-                    Ok(Some(crate::Command::Compute(crate::ComputeArgs {
-                        command: None
-                            | Some(
-                                ComputeCommand::Catalog(_)
-                                    | ComputeCommand::Status
-                                    | ComputeCommand::Show { .. }
-                                    | ComputeCommand::Instructions {
-                                        command: InstructionsCommand::Show
-                                    }
-                                    | ComputeCommand::SshConfig {
-                                        command: SshConfigCommand::Show
-                                    }
-                            ),
-                        ..
-                    })))
-                )
-        }
-        // Verbs with a write subcommand: allow only the read-only subcommand(s).
-        "project" => matches!(subcommand(&mut rest), Some("view")),
-        "exp" => match subcommand(&mut rest) {
-            // Pure reads.
-            Some("status" | "wait") => true,
-            // `desc` views the node's notes, but writes them with
-            // `--set`/`--stdin`. Allow only the read form.
-            Some("desc") => !stage.contains("--set") && !stage.contains("--stdin"),
-            _ => false,
-        },
-
-        // Everything else — create-*, instance, login/logout, install-skills,
-        // update, serve, supervise, up, and any unrecognized future verb — is
-        // gated. Allowlist-only: unknown ⇒ not read-only.
-        _ => false,
-    }
-}
-
-/// True iff a tokenized `git …` invocation is read-only. Allowlist-only, with
-/// argument guards on the escape hatches a read verb can carry.
-fn is_readonly_git(tokens: &[&str]) -> bool {
-    // Global flags between `git` and the verb: only the harmless pager/cwd
-    // ones. Anything else — `-c key=val`, `--exec-path`, `--git-dir`,
-    // `--config-env`, … — can change what git *executes* (pager, alias, and
-    // hook overrides are arbitrary-command vectors), so it gates.
-    let mut i = 1;
-    while i < tokens.len() && tokens[i].starts_with('-') {
-        match tokens[i] {
-            "-P" | "--no-pager" => i += 1,
-            "-C" => i += 2, // consumes its <path> argument
-            _ => return false,
-        }
-    }
-    let Some(&verb) = tokens.get(i) else {
-        // Bare `git` prints usage, but there's no reason to batch it — gate.
-        return false;
-    };
-    let args = &tokens[i + 1..];
-
-    if GIT_WHOLE_VERB_READS.contains(&verb) {
-        // The write escapes a read verb can carry: `--output[=<file>]` writes a
-        // file from log/show/diff, and grep's `-O`/`--open-files-in-pager`
-        // executes an arbitrary pager.
-        return !args
-            .iter()
-            .any(|a| a.starts_with("--output") || a.starts_with("-O") || a.starts_with("--open-"));
-    }
-
-    // A positional arg on `branch`/`tag` creates unless a list-query flag makes
-    // positionals mean patterns; the write flags always gate.
-    let has_positional = |args: &[&str]| args.iter().any(|a| !a.starts_with('-'));
-    let has_flag = |args: &[&str], flags: &[&str]| {
-        args.iter().any(|a| {
-            flags
-                .iter()
-                .any(|f| a == f || a.starts_with(&format!("{f}=")))
-        })
-    };
-
-    match verb {
-        "branch" => {
-            const WRITES: &[&str] = &[
-                "-d",
-                "-D",
-                "-m",
-                "-M",
-                "-c",
-                "-C",
-                "-f",
-                "-u",
-                "--delete",
-                "--move",
-                "--copy",
-                "--force",
-                "--edit-description",
-                "--set-upstream-to",
-                "--unset-upstream",
-                "--create-reflog",
-                "--track",
-                "--no-track",
-            ];
-            const LISTS: &[&str] = &[
-                "--list",
-                "--show-current",
-                "--contains",
-                "--no-contains",
-                "--merged",
-                "--no-merged",
-                "--points-at",
-            ];
-            !has_flag(args, WRITES) && (!has_positional(args) || has_flag(args, LISTS))
-        }
-        "tag" => {
-            const WRITES: &[&str] = &[
-                "-a",
-                "-s",
-                "-u",
-                "-F",
-                "-m",
-                "-d",
-                "-f",
-                "-e",
-                "--annotate",
-                "--sign",
-                "--file",
-                "--message",
-                "--delete",
-                "--force",
-                "--edit",
-            ];
-            const LISTS: &[&str] = &[
-                "-l",
-                "--list",
-                "--contains",
-                "--no-contains",
-                "--merged",
-                "--no-merged",
-                "--points-at",
-            ];
-            !has_flag(args, WRITES) && (!has_positional(args) || has_flag(args, LISTS))
-        }
-        "stash" => matches!(subcommand(&mut args.iter().copied()), Some("list" | "show")),
-        "remote" => matches!(
-            subcommand(&mut args.iter().copied()),
-            None | Some("show") | Some("get-url")
-        ),
-        "worktree" => matches!(subcommand(&mut args.iter().copied()), Some("list")),
-        "reflog" => matches!(subcommand(&mut args.iter().copied()), None | Some("show")),
-
-        // Everything else — commit, push, checkout, fetch, config, … — gates.
-        _ => false,
-    }
-}
-
-/// The next non-flag token, read as a subcommand name.
-fn subcommand<'a>(tokens: &mut impl Iterator<Item = &'a str>) -> Option<&'a str> {
-    tokens.find(|t| !t.starts_with('-'))
+    // Bare orx is not reliably a help-only operation: platform launch logic
+    // can open the desktop app. Explicit --help/--version returned above.
+    matches!(
+        command,
+        Some(
+            Command::Projects(_)
+                | Command::Orgs(_)
+                | Command::Runs(_)
+                | Command::Logs(_)
+                | Command::Discover(_)
+                | Command::Paper(_)
+                | Command::Skill(_)
+                | Command::Version(_)
+                | Command::Project(ProjectArgs {
+                    command: ProjectCommand::View { .. }
+                })
+                | Command::Exp(ExpArgs {
+                    command: ExpCommand::Status { .. }
+                        | ExpCommand::Wait { .. }
+                        | ExpCommand::Desc {
+                            set: None,
+                            stdin: false,
+                            ..
+                        }
+                })
+                | Command::Compute(ComputeArgs {
+                    command: None
+                        | Some(
+                            ComputeCommand::Catalog(_)
+                                | ComputeCommand::Status
+                                | ComputeCommand::Show { .. }
+                                | ComputeCommand::Instructions {
+                                    command: InstructionsCommand::Show
+                                }
+                                | ComputeCommand::SshConfig {
+                                    command: SshConfigCommand::Show
+                                }
+                        ),
+                    ..
+                })
+        )
+    )
 }
 
 #[cfg(test)]
@@ -453,6 +303,137 @@ mod tests {
 
     fn allowed(command: &str) -> bool {
         decide(&payload(command)).is_some()
+    }
+
+    #[test]
+    fn stream_consumers_with_write_or_execution_modes_are_gated() {
+        for command in [
+            "sort -o /tmp/target /tmp/input",
+            "sort --output=/tmp/target /tmp/input",
+            "sort --compress-program=/tmp/helper /tmp/input",
+            "echo payload | uniq - /tmp/target",
+            "uniq /tmp/input /tmp/target",
+        ] {
+            assert!(!allowed(command), "should gate: {command}");
+        }
+    }
+
+    #[test]
+    fn shell_normalization_cannot_hide_write_flags() {
+        for command in [
+            "orx exp desc e-1 --s''et=changed",
+            "orx exp desc e-1 --\"set\"=changed",
+            r"orx exp desc e-1 --s\et=changed",
+            "orx exp desc e-1 --st''din",
+            "orx exp desc e-1 ${FLAGS}",
+            "orx exp desc e-1 *",
+            "orx exp desc e-1 $'--set=changed'",
+            "orx exp desc e-1 # --set=changed",
+            "orx exp desc e-1\r--set=changed",
+            "orx exp desc e-1\u{00a0}--set=changed",
+        ] {
+            assert!(!allowed(command), "should gate: {command}");
+        }
+    }
+
+    #[test]
+    fn git_reads_with_configured_executables_require_approval() {
+        // Even apparently plain reads can invoke fsmonitor, a pager, textconv,
+        // external diffs or remote helpers from repository/user configuration.
+        for command in [
+            "git status",
+            "git log",
+            "git diff --ext-diff",
+            "git show --textconv HEAD:file",
+            "git remote show origin",
+            "git log --out''put=/tmp/target",
+            "git branch -uorigin/main",
+            "git branch --edit-descrip",
+            "/tmp/untrusted/git status",
+        ] {
+            assert!(!allowed(command), "should gate: {command}");
+        }
+    }
+
+    #[test]
+    fn bare_invocations_require_approval_but_explicit_help_does_not() {
+        // main() may launch the desktop app for an absent subcommand.
+        for command in ["orx", "orx --no-telemetry"] {
+            assert!(!allowed(command), "should gate: {command}");
+        }
+        let executable = crate::paths::spawnable_exe().unwrap();
+        assert!(!allowed(&format!("'{}'", executable.display())));
+        for command in ["orx --help", "orx -h", "orx --no-telemetry --help"] {
+            assert!(allowed(command), "should allow: {command}");
+        }
+    }
+
+    #[test]
+    fn executable_basename_does_not_establish_identity() {
+        assert!(!allowed("/tmp/untrusted/orx runs p-1"));
+        assert!(!allowed("./orx runs p-1"));
+    }
+
+    #[test]
+    fn literal_quoted_arguments_are_normalized_and_safe_reads_survive() {
+        for command in [
+            "orx discover keyword 'attention mechanisms'",
+            "orx discover keyword \"attention mechanisms\"",
+            "orx exp desc 'e-1'",
+            "orx projects --json",
+            "orx runs p-1 2>&1 | head -5",
+            "orx --help",
+            "orx compute configure ssh --help",
+            "echo ''",
+        ] {
+            assert!(allowed(command), "should allow: {command}");
+        }
+        let executable = crate::paths::spawnable_exe().unwrap();
+        assert!(allowed(&format!("'{}' runs p-1", executable.display())));
+    }
+
+    #[test]
+    fn literal_word_tokenizer_matches_shell_quote_removal() {
+        assert_eq!(
+            stage_tokens("orx exp desc 'e-1' --s''et=changed 2>&1"),
+            Some(
+                vec!["orx", "exp", "desc", "e-1", "--set=changed"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+            )
+        );
+        assert_eq!(
+            stage_tokens("echo '' '2>&1'"),
+            Some(
+                vec!["echo", "", "2>&1"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+            )
+        );
+        assert!(allowed("orx discover keyword 'literal $dollar'"));
+    }
+
+    #[test]
+    fn incomplete_or_dynamic_shell_syntax_defers() {
+        for command in [
+            "orx exp desc 'e-1",
+            "orx exp desc \"e-1",
+            "orx exp desc \"$EXPERIMENT\"",
+            "orx exp desc $(echo e-1)",
+            "orx exp desc `echo e-1`",
+            "orx exp desc e-1 > /tmp/target",
+            "orx exp desc e-1 2>&1suffix",
+            "orx exp desc e-1 &",
+            "orx exp desc e-1\norx projects",
+            "orx projects || echo fallback",
+            "orx projects |",
+            "orx projects | | head",
+            "2>&1",
+        ] {
+            assert!(!allowed(command), "should gate: {command}");
+        }
     }
 
     #[test]
@@ -487,8 +468,8 @@ mod tests {
     #[test]
     fn whole_verb_reads_are_allowed() {
         for c in [
-            "orx runs",
-            "orx logs r-123 --tail 200",
+            "orx runs p-1",
+            "orx logs r-123",
             "orx compute",
             "orx orgs",
             "orx discover keyword transformers",
@@ -496,8 +477,6 @@ mod tests {
             "orx paper 2301.00001",
             "orx skill",
             "orx projects --json",
-            "/usr/local/bin/orx runs",
-            "orx", // bare usage
         ] {
             assert!(allowed(c), "should allow: {c}");
         }
@@ -538,8 +517,8 @@ mod tests {
             "orx delete all",
             "orx up",
             "orx serve",
-            // A network POST, not a read: it gets an approval card like any
-            // other non-read verb.
+            // A network POST defers to the active permission mode instead of
+            // being auto-approved by this classifier.
             "orx feedback --kind bug --summary 'x' --details 'y, then z'",
         ] {
             assert!(!allowed(c), "should gate: {c}");
@@ -558,7 +537,7 @@ mod tests {
         assert!(!allowed("git push"));
         assert!(!allowed("python train.py"));
         // A program that merely ends in text containing orx is not `orx`.
-        assert!(!allowed("neworx runs"));
+        assert!(!allowed("neworx runs p-1"));
     }
 
     #[test]
@@ -567,12 +546,12 @@ mod tests {
         // but any segment that is a write, or any metacharacter a per-segment scan
         // can't reason about, gates the whole line. A read-only prefix must never
         // smuggle a second command through.
-        assert!(!allowed("orx runs; orx exp run e-1")); // write segment
-        assert!(!allowed("orx runs && rm -rf /")); // non-orx segment
+        assert!(!allowed("orx runs p-1; orx exp run e-1")); // write segment
+        assert!(!allowed("orx runs p-1 && rm -rf /")); // non-orx segment
         assert!(!allowed(
-            "orx runs; echo hi; orx create-experiment p-1 --title x"
+            "orx runs p-1; echo hi; orx create-experiment p-1 --title x"
         )); // write in a batch
-        assert!(!allowed("orx runs | tee /etc/passwd")); // pipe into a writer
+        assert!(!allowed("orx runs p-1 | tee /etc/passwd")); // pipe into a writer
         assert!(!allowed("orx logs r-1 > /tmp/x")); // redirection
         assert!(!allowed("orx logs \"$(rm -rf /)\"")); // command substitution
         assert!(!allowed("orx runs `whoami`")); // backtick substitution
@@ -587,14 +566,14 @@ mod tests {
         // failing to run. Each segment is independently read-only, so the whole
         // line is allowed.
         assert!(allowed("orx exp desc e-1; echo ====; orx exp desc e-2"));
-        assert!(allowed("orx runs && orx logs r-1"));
+        assert!(allowed("orx runs p-1 && orx logs r-1"));
         assert!(allowed("orx exp desc e-1 && orx project view p-1"));
         // Mixed `&&` and `;` in one line exercises the two-level split.
-        assert!(allowed("orx runs && orx logs r-1; echo done"));
+        assert!(allowed("orx runs p-1 && orx logs r-1; echo done"));
         // Harmless glue on its own, and shell-tolerated trailing/empty segments.
         assert!(allowed("echo hello"));
-        assert!(allowed("orx runs;"));
-        assert!(allowed("orx runs ; ; orx logs r-1"));
+        assert!(allowed("orx runs p-1;"));
+        assert!(allowed("orx runs p-1 ; ; orx logs r-1"));
         // A read/view form batched with its own write form still gates: the
         // `--set` segment is a write.
         assert!(!allowed("orx exp desc e-1; orx exp desc e-1 --set \"x\""));
@@ -604,36 +583,36 @@ mod tests {
     fn readonly_pipelines_are_allowed() {
         // The other pattern plan mode kept failing on: reads piped through pure
         // consumers, with the customary stderr-merge.
-        assert!(allowed("orx runs 2>&1 | head -50"));
+        assert!(allowed("orx runs p-1 2>&1 | head -50"));
         assert!(allowed("orx logs r-1 2>&1 | grep -i error | tail -5"));
         assert!(allowed("orx runs r-1 2>&1"));
-        assert!(allowed("git log --oneline | head -20"));
-        assert!(allowed("git ls-tree -r HEAD | grep -i py"));
-        assert!(allowed("git show origin/b:mem2gen/orx_run.py | head -100"));
+        assert!(!allowed("git log --oneline | head -20"));
+        assert!(!allowed("git ls-tree -r HEAD | grep -i py"));
+        assert!(!allowed("git show origin/b:mem2gen/orx_run.py | head -100"));
         // Consumers stand alone and pipe among themselves.
         assert!(allowed("wc -l README.md"));
-        assert!(allowed("cat notes.md | grep TODO | sort | uniq"));
+        assert!(allowed("cat notes.md | grep TODO | wc -l"));
         // Pipelines and sequences compose.
-        assert!(allowed("orx runs | head -5; echo ok && git status"));
+        assert!(allowed("orx runs p-1 | head -5; echo ok && orx projects"));
         // No-space pipes parse the same way the shell parses them.
-        assert!(allowed("orx runs 2>&1|head -5"));
+        assert!(allowed("orx runs p-1 2>&1|head -5"));
     }
 
     #[test]
     fn nonreadonly_pipelines_are_gated() {
-        assert!(!allowed("orx runs | xargs rm")); // consumer that spawns commands
-        assert!(!allowed("orx runs | sed -i s/x/y/ f")); // sed excluded (writes)
-        assert!(!allowed("orx runs | awk '{system(\"id\")}'")); // awk excluded
-        assert!(!allowed("orx runs | head > /tmp/x")); // redirect in a stage
-        assert!(!allowed("orx runs || rm -rf /")); // `||` is not a pipe
-        assert!(!allowed("orx runs |")); // trailing pipe
+        assert!(!allowed("orx runs p-1 | xargs rm")); // consumer that spawns commands
+        assert!(!allowed("orx runs p-1 | sed -i s/x/y/ f")); // sed excluded (writes)
+        assert!(!allowed("orx runs p-1 | awk '{system(\"id\")}'")); // awk excluded
+        assert!(!allowed("orx runs p-1 | head > /tmp/x")); // redirect in a stage
+        assert!(!allowed("orx runs p-1 || rm -rf /")); // `||` is not a pipe
+        assert!(!allowed("orx runs p-1 |")); // trailing pipe
         assert!(!allowed("| head")); // no producer
         assert!(!allowed("cargo metadata | head")); // unknown producer
-        assert!(!allowed("head -1 f | orx runs")); // orx is not a consumer
+        assert!(!allowed("head -1 f | orx runs p-1")); // orx is not a consumer
     }
 
     #[test]
-    fn git_reads_are_allowed() {
+    fn git_commands_require_approval_even_for_ordinary_reads() {
         for c in [
             "git status",
             "git log --oneline -20",
@@ -665,7 +644,7 @@ mod tests {
             "git reflog",
             "/usr/bin/git status",
         ] {
-            assert!(allowed(c), "should allow: {c}");
+            assert!(!allowed(c), "should gate: {c}");
         }
     }
 
@@ -711,7 +690,7 @@ mod tests {
 
     #[test]
     fn non_bash_tools_defer() {
-        let p = json!({ "tool_name": "Edit", "tool_input": { "command": "orx runs" } });
+        let p = json!({ "tool_name": "Edit", "tool_input": { "command": "orx runs p-1" } });
         assert!(decide(&p).is_none());
         // Missing command field → defer, not panic.
         let p = json!({ "tool_name": "Bash", "tool_input": {} });
@@ -731,7 +710,7 @@ mod tests {
 
     #[test]
     fn allow_decision_has_the_exact_wire_shape() {
-        let out = decide(&payload("orx runs")).unwrap();
+        let out = decide(&payload("orx runs p-1")).unwrap();
         assert_eq!(
             out.pointer("/hookSpecificOutput/hookEventName")
                 .and_then(Value::as_str),

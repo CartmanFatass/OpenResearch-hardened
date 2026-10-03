@@ -6,8 +6,10 @@ after a defensive audit of the upstream tree found that several privacy- and inj
 behaviors were on by default. Upstream discloses most of them; this fork simply chooses the
 conservative side of each default.
 
-Everything else — features, commands, and the agent-harness integrations — is unchanged from
-the upstream tree this fork was cut from.
+The follow-up [security verification report](docs/security/audit-2026-10-03.md)
+records which original findings are fully fixed, partially mitigated, or still
+present, plus the additional approval, credential-lifetime and installation
+changes. A hardened default is not a proof that untrusted agent workloads are safe.
 
 ## 1. Telemetry is opt-in, not opt-out
 
@@ -38,9 +40,13 @@ from `sha256.sum`. Windows additionally executed the `.ps1` with no verification
   still uses the rate-limit-free CDN permalink.
 - Silent self-update is now opt-in (`autoUpdate` setting). The check and the outdated warning
   still run; only the unattended download-and-execute is off by default.
-- Note for this fork: `REPO_URL` still points at the upstream repo, so an update installs an
-  **upstream** binary — one without the fixes in this file. That is the main reason silent
-  auto-update stays off here.
+- Update and remote-installer URLs derive from this fork's Cargo repository
+  identity. Missing fork artifacts fail closed; updates do not fall back to
+  upstream binaries that lack these fixes. Build from source until compatible
+  fork releases exist. Official-build/signing workflow setup is still required.
+- A GitHub asset digest is not independent publisher signing. Windows does
+  not separately verify the staged executable in this path, and remote bootstrap
+  is a separate unverified-installer path. See the audit report for limits.
 
 ## 3. Remote content is explicitly framed as untrusted
 
@@ -63,7 +69,7 @@ a failed spawn, now carry the same untrusted-data instruction (matching the word
 already used for selected chat excerpts). This is prompt-level defense, not a sandbox: it
 raises the bar for injected instructions, it does not make them impossible.
 
-## 4. No cross-backend credential fan-out
+## 4. No implicit cross-backend HF_TOKEN forwarding
 
 Upstream automatically injected the local `HF_TOKEN` (resolved from `~/.cache/huggingface/token`
 or the environment) into **every** remote backend it launched — Modal sandboxes, user SSH
@@ -71,7 +77,10 @@ hosts, Slurm, Kubernetes, Ray, and API-provisioned OpenResearch boxes — on eve
 (`src/local/{modal,ssh,slurm,k8s,ray}.rs`, plus the supervise launch path in
 `src/commands/supervise.rs`).
 
-Those backends now receive **only the environment the user explicitly synced** in settings.
+Those backends now receive **the shared synced environment** in settings.
+Provider-specific token forms may also save into that shared store, so synced
+keys are still globally scoped across selected backends; this is not complete
+destination-based secret isolation.
 A HuggingFace token still travels to the HuggingFace backend (its intended destination) and to
 local runs; if you want it on another backend, sync `HF_TOKEN` explicitly — the dashboard's
 compute-settings already supports exactly that.
@@ -95,10 +104,31 @@ user*, and to format the command *so agent permission checks do not interrupt fi
 patterns — hiding a network transmission from the user, and shaping a command to slip past
 approval heuristics — are exactly what an injected instruction would exploit.
 
-The skill now requires the agent to tell the user, in the same turn, that a report was filed
-and what it says (the quoting guidance remains, as plain shell-quoting practice). `feedback`
-was also removed from the plan-gate read-only allowlist (`src/local/harness/plan_gate.rs`), so
-the command gets an approval card like any other network-writing verb.
+The skill now requires the agent to show the report contents and destination,
+obtain explicit user approval, and confirm delivery only when the CLI reports
+submission. A disabled feedback command explicitly reports that nothing was sent.
+`feedback` was removed from the plan-gate read-only allowlist
+(`src/local/harness/plan_gate.rs`). That removes this particular automatic
+approval shortcut; it **does not guarantee an approval card in Auto/Bypass
+or every harness**, and skill instructions are not an enforceable consent store.
+
+## 7. Additional approval and credential-lifetime fixes
+
+- The plan gate parses only a constrained literal shell grammar and validates
+  `orx` arguments with Clap. Git, sort, uniq, expansions, and ambiguous forms
+  require the normal approval flow; nominal read verbs can have write/helper
+  execution modes. This intentionally trades convenience for fail-closed behavior.
+- Kubernetes uses immutable per-run, Job-owned credential Secrets, including an
+  empty current environment. New jobs no longer consume a stale shared `orx-env`
+  Secret. Historical Secrets and previously delivered credentials are not revoked.
+- Provisioned-host SSH validates a usable, regular private known_hosts file
+  before connecting. This remains TOFU with filesystem preflight, not independent
+  verification of the first host key or a guarantee against later storage failure.
+- Credential and synced-env writes use owner-only temporary inodes and atomic
+  replacement, rather than writing secret bytes before chmod. On Windows,
+  inherited directory ACLs remain the access-control mechanism.
+- Per-run `ORX_NO_TELEMETRY`/`--no-telemetry` now suppress consent events and
+  queued consent retries as well as product telemetry.
 
 ## Known remaining risks (deliberately not changed)
 
@@ -116,7 +146,9 @@ the command gets an approval card like any other network-writing verb.
 
 ## Verification
 
-These changes were made without a local Rust toolchain; the compile, clippy, rustfmt, and test
-verification is GitHub Actions (`.github/workflows/ci.yml`, runs on push to `main`), exactly as
-upstream CI does. The audit findings that motivated each fix are reproducible from the file
-references above against the upstream tree.
+See [the follow-up audit](docs/security/audit-2026-10-03.md) and its pull request
+for regression-test results and platform limits. The original hardening was
+made without a local Rust toolchain, and its initial CI was not fully passing.
+The follow-up checks include actual Rust compilation and targeted failing-then-
+passing regressions. Do not infer live-provider, Windows, macOS or adversarial
+model validation from Linux unit-test results.

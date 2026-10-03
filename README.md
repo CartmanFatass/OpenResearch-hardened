@@ -10,21 +10,7 @@
 <img src=".github/readme-assets/cursor.svg" alt="" width="16" height="16" align="texttop" /> Cursor, or Google Antigravity into research agents that can review
 literature, develop hypotheses, run experiments, and produce research artifacts.</p>
 
-<p>
-<a href="https://github.com/alphaXiv/OpenResearch/releases/latest/download/OpenResearch.dmg"><picture><source media="(prefers-color-scheme: dark)" srcset=".github/readme-assets/download-macos-dark.svg"><img src=".github/readme-assets/download-macos.svg" alt="Download OpenResearch for macOS" width="220" height="44" /></picture></a>
-<a href="https://github.com/alphaXiv/OpenResearch/releases/latest/download/OpenResearch-Setup.exe"><picture><source media="(prefers-color-scheme: dark)" srcset=".github/readme-assets/download-windows-dark.svg"><img src=".github/readme-assets/download-windows.svg" alt="Download OpenResearch for Windows (Beta)" width="220" height="44" /></picture></a>
-<a href="https://github.com/alphaXiv/OpenResearch/releases/latest/download/OpenResearch-x86_64.AppImage"><picture><source media="(prefers-color-scheme: dark)" srcset=".github/readme-assets/download-linux-dark.svg"><img src=".github/readme-assets/download-linux.svg" alt="Download OpenResearch for Linux" width="220" height="44" /></picture></a>
-</p>
-
-<p>
-<a href="https://openresearch.sh/docs"><img src=".github/readme-assets/action-documentation.svg" alt="Documentation" width="132" height="24" /></a><img src=".github/readme-assets/action-separator.svg" alt=" · " width="12" height="24" />
-<a href="https://github.com/alphaXiv/OpenResearch/releases"><img src=".github/readme-assets/action-releases.svg" alt="Releases" width="78" height="24" /></a>
-</p>
-
-<p><sub>macOS 11+ · Windows beta requires <a href="docs/windows.md">Git for Windows</a> · Linux app needs glibc 2.35+</sub></p>
-
-<p><a href="https://trendshift.io/repositories/89363"><img src="https://trendshift.io/api/badge/repositories/89363" alt="GitHub Trending: #1 Repository of the Day" width="250" height="55" /></a>
-<a href="https://trendshift.io/repositories/89363?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-89363" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/89363/daily?language=Rust" alt="alphaXiv/OpenResearch | Trendshift" width="250" height="55" /></a></p>
+<p><a href="#get-started">Build the hardened fork from source</a> · <a href="SECURITY_FIXES.md">Security changes and limitations</a></p>
 
 </div>
 
@@ -32,52 +18,45 @@ literature, develop hypotheses, run experiments, and produce research artifacts.
 > **Security-hardened fork** of [alphaXiv/OpenResearch](https://github.com/alphaXiv/OpenResearch)
 > (MIT, upstream © its authors — see `LICENSE`). Defaults here are the conservative side of
 > upstream's: telemetry and auto-update are opt-in, installers are digest-verified, remote
-> text is framed as untrusted, and credentials do not fan out across compute backends. See
+> text is framed as untrusted, and implicit HuggingFace-token forwarding is restricted. Explicitly synced environment variables still reach every selected compute backend. See
 > [SECURITY_FIXES.md](SECURITY_FIXES.md) for every change and the remaining known risks.
 
 ## Get started
 
-Install the CLI on macOS or Linux, then launch OpenResearch:
+Build **this repository** to obtain the hardening. The installers at
+`openresearch.sh` and the binaries published by `alphaXiv/OpenResearch` are
+upstream products and **do not include this fork's changes**. Do not use them
+to install or update the hardened fork.
+
+With Git and a current stable Rust toolchain installed:
 
 ```sh
-curl -LsSf https://openresearch.sh/install.sh | sh
-orx up
+git clone https://github.com/CartmanFatass/OpenResearch-hardened.git
+cd OpenResearch-hardened
+cargo build --release --locked
+./target/release/orx up
 ```
 
-`orx up` opens the local dashboard at `http://127.0.0.1:4791`.
+On Windows, use `target\release\orx.exe up` after the build. On macOS and Linux,
+the command above starts the local dashboard at `http://127.0.0.1:4791`.
+The committed UI is embedded by the Rust build. See [AGENTS.md](AGENTS.md) for
+UI development and validation commands.
 
-On a managed Mac (for example, a work computer), use the macOS download above
-instead. Device-management policies may block the CLI that `install.sh`
-installs because it is not yet signed. The app is signed with a Developer ID
-and notarized by Apple. To use `orx` in your terminal, click **Install** under
-**Install the `orx` command** in the app's Settings → Updates, or run (adjusting
-the path if the app is not in `/Applications`):
+Updates in this fork resolve only against this fork's release repository.
+Until compatible fork releases are published, rebuild a reviewed revision
+from source; there is no fallback to upstream. Source installs are not
+installer-managed, so `orx update` does not replace them. The inherited
+release-signing/official-build workflow requires separate maintainer setup;
+this project does not claim upstream's code-signing or notarization identity.
 
-```sh
-/Applications/OpenResearch.app/Contents/MacOS/orx install-cli
-```
-
-Either way, `orx` is linked into `~/.local/bin`, with a hint to add it to your
-`PATH` if needed. If you already ran `install.sh`, remove `~/.cargo/bin/orx`
-first and open a new terminal.
-
-On Windows, use the beta download above after installing
-[Git for Windows](docs/windows.md). It installs for your account, with no
-administrator prompt. The installer isn't signed yet, so Windows may say
-"Windows protected your PC": choose **More info** → **Run anyway**.
-
-On Linux, the desktop app is an AppImage for
-[x86_64](https://github.com/alphaXiv/OpenResearch/releases/latest/download/OpenResearch-x86_64.AppImage)
-or [ARM64](https://github.com/alphaXiv/OpenResearch/releases/latest/download/OpenResearch-aarch64.AppImage).
-Keep it somewhere you can write to, such as `~/Applications`, so it can update
-itself, then change to that directory, run `chmod +x OpenResearch-*.AppImage`, and open it. See
-[Linux](docs/linux.md) for requirements.
+Telemetry is disabled in source builds. Agent execution is still highly
+autonomous by default; review the [remaining risks](SECURITY_FIXES.md#known-remaining-risks-deliberately-not-changed)
+before supplying credentials or running untrusted research content.
 
 [Connect a local model](docs/local-models.md) to use LM Studio, oMLX, Ollama,
-or a custom endpoint with OpenCode.
-
-Create an account at [openresearch.sh](https://openresearch.sh) to receive email
-updates and use managed OpenResearch compute.
+or a custom endpoint with OpenCode. The platform-specific documents below
+retain upstream packaging details and are not proof that hardened installers
+are available.
 
 ## Built for research agents
 

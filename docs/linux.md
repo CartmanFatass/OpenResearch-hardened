@@ -1,5 +1,11 @@
 # Linux
 
+> **Fork installation notice:** This document describes upstream packaging.
+> Downloads or install commands pointing to `alphaXiv/OpenResearch` install
+> upstream binaries without this fork's hardening. To use the hardened fork,
+> follow [the source-build instructions](../README.md#get-started).
+
+
 ## The desktop app
 
 From [Releases](https://github.com/alphaXiv/OpenResearch/releases), download

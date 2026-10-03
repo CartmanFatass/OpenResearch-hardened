@@ -34,8 +34,9 @@ pub mod macos_app;
 #[cfg(windows)]
 pub(crate) mod windows;
 
-/// GitHub repo the released binaries come from.
-pub const REPO_URL: &str = "https://github.com/alphaXiv/OpenResearch";
+/// GitHub repo the released binaries come from. Keep self-updates on the same
+/// fork cargo-dist uses when generating its installers.
+pub const REPO_URL: &str = env!("CARGO_PKG_REPOSITORY");
 
 /// The cargo-dist app name (the *package* name, not the `orx` bin name) — used
 /// in release asset names and the receipt path.
@@ -605,11 +606,17 @@ pub fn auto_update_eligible() -> bool {
 
 /// The one-liner that reinstalls orx through the release installer.
 const INSTALL_HINT: &str = if cfg!(windows) {
-    "powershell -ExecutionPolicy Bypass -c \"irm \
-https://github.com/alphaXiv/OpenResearch/releases/latest/download/openresearch-cli-installer.ps1 | iex\""
+    concat!(
+        "powershell -ExecutionPolicy Bypass -c \"irm ",
+        env!("CARGO_PKG_REPOSITORY"),
+        "/releases/latest/download/openresearch-cli-installer.ps1 | iex\""
+    )
 } else {
-    "curl --proto '=https' --tlsv1.2 -LsSf \
-https://github.com/alphaXiv/OpenResearch/releases/latest/download/openresearch-cli-installer.sh | sh"
+    concat!(
+        "curl --proto '=https' --tlsv1.2 -LsSf ",
+        env!("CARGO_PKG_REPOSITORY"),
+        "/releases/latest/download/openresearch-cli-installer.sh | sh"
+    )
 };
 
 /// Confirm a directory can be written before an update commits to it — root-owned
@@ -1558,6 +1565,19 @@ mod tests {
     use std::ffi::OsString;
     use std::path::Path;
     use std::path::PathBuf;
+
+    #[test]
+    fn update_sources_preserve_the_hardened_fork() {
+        const FORK: &str = "https://github.com/CartmanFatass/OpenResearch-hardened";
+        assert_eq!(super::REPO_URL, FORK);
+        assert_eq!(env!("CARGO_PKG_REPOSITORY"), FORK);
+        assert_eq!(
+            super::api_repos_url().unwrap(),
+            "https://api.github.com/repos/CartmanFatass/OpenResearch-hardened"
+        );
+        assert!(super::INSTALL_HINT.contains(FORK));
+        assert!(!super::INSTALL_HINT.contains("alphaXiv/OpenResearch"));
+    }
 
     #[test]
     fn sha256_hex_matches_known_vector() {

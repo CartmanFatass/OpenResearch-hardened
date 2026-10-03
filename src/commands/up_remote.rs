@@ -2404,6 +2404,8 @@ mod tests {
     #[test]
     fn remote_install_uses_the_release_installer_in_the_login_environment() {
         let command = remote_login_orx_cmd(&remote_installer("1.2.3"));
+        assert!(command.contains("https://github.com/CartmanFatass/OpenResearch-hardened/"));
+        assert!(!command.contains("alphaXiv/OpenResearch"));
         assert!(command.contains("openresearch-cli-installer.sh"));
         assert!(command.contains("/releases/download/v1.2.3/"));
         assert!(!command.contains("releases/latest"));
@@ -2612,6 +2614,7 @@ mod tests {
         let target = SshTarget {
             dest: "mybox".into(),
             extra_opts: vec!["-p".into(), "2222".into()],
+            managed_known_hosts: None,
         };
         let args =
             crate::jobs::ssh::forward_args(&target, "127.0.0.1:7:localhost:7", "orx up").unwrap();

@@ -112,6 +112,15 @@ pub async fn load_credentials() -> Result<Option<Credentials>> {
     }
 }
 
+/// Write secrets into a new owner-only inode, then atomically replace the
+/// destination. On Windows the containing directory's ACL applies.
+fn write_private_config(path: &std::path::Path, body: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    crate::local::git::atomic_write_with_mode(path, body, Some(0o600))
+}
+
 /// Persists credentials as pretty JSON with a trailing newline, mode 0600.
 pub async fn save_credentials(creds: &Credentials) -> Result<()> {
     let path = credentials_path();
@@ -119,14 +128,10 @@ pub async fn save_credentials(creds: &Credentials) -> Result<()> {
         fs::create_dir_all(parent).await?;
     }
     let body = format!("{}\n", serde_json::to_string_pretty(creds)?);
-    fs::write(&path, body).await?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        fs::set_permissions(&path, perms).await?;
-    }
+    // Create the temporary inode owner-only before writing any secret bytes.
+    // Atomic replacement also avoids truncating a symlink target or exposing
+    // a partially written credential file to concurrent readers.
+    write_private_config(&path, body.as_bytes())?;
 
     Ok(())
 }
@@ -184,12 +189,7 @@ fn save_overleaf_credentials(credentials: &OverleafCredentials) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let body = serde_json::to_string_pretty(credentials)?;
-    std::fs::write(&path, format!("{body}\n"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    write_private_config(&path, format!("{body}\n").as_bytes())?;
     Ok(())
 }
 
@@ -385,7 +385,7 @@ pub fn remove_synced_env_var(key: &str) -> Result<()> {
     } else {
         format!("{}\n", lines.join("\n"))
     };
-    std::fs::write(&path, body)?;
+    write_private_config(&path, body.as_bytes())?;
     Ok(())
 }
 
@@ -427,22 +427,7 @@ pub fn write_synced_env_vars(values: &[(&str, &str)]) -> Result<()> {
         }
     }
     let body = format!("{}\n", lines.join("\n"));
-    {
-        use std::io::Write;
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600); // applies on create only
-        }
-        opts.open(&path)?.write_all(body.as_bytes())?;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    write_private_config(&path, body.as_bytes())?;
     Ok(())
 }
 
@@ -473,4 +458,46 @@ pub fn set_ssh_host(host: String, options: SshHostSettings) -> Result<()> {
 pub fn set_ssh_default(host: Option<String>) -> Result<()> {
     crate::telemetry::set_ssh_default(host)?;
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod private_config_tests {
+    use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    #[test]
+    fn secret_writes_replace_public_inode_with_private_inode() {
+        let dir = std::env::temp_dir().join(format!("orx-private-config-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("credentials.json");
+        write_private_config(&path, b"first synthetic value").unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let old_link = dir.join("old-inode");
+        std::fs::hard_link(&path, &old_link).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_private_config(&path, b"second synthetic value").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second synthetic value");
+        assert_eq!(std::fs::read(&old_link).unwrap(), b"first synthetic value");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn secret_writes_reject_symlink_without_changing_target() {
+        let dir = std::env::temp_dir().join(format!("orx-private-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("unrelated");
+        std::fs::write(&target, b"unchanged").unwrap();
+        let path = dir.join("credentials.json");
+        symlink(&target, &path).unwrap();
+        assert!(write_private_config(&path, b"synthetic value").is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
