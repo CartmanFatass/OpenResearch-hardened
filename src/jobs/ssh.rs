@@ -20,7 +20,6 @@ pub use container::{
 };
 
 use std::collections::HashMap;
-#[cfg(unix)]
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -62,12 +61,14 @@ fn prepare_control_dir() -> Result<()> {
     let mut permissions = metadata.permissions();
     permissions.set_mode(0o700);
     std::fs::set_permissions(&dir, permissions)?;
-    Ok(())
+    // Runs before every ssh invocation, so accept-new can always record keys.
+    ensure_known_hosts_dir()
 }
 
 #[cfg(not(unix))]
 fn prepare_control_dir() -> Result<()> {
-    Ok(())
+    // No control dir on Windows; still ensure accept-new can record keys.
+    ensure_known_hosts_dir()
 }
 
 #[derive(Debug, Clone)]
@@ -150,10 +151,17 @@ pub enum HostKeyPolicy {
     /// recorded, and a later key change is caught. For a freshly-seen box
     /// identified by a raw IP (nothing to have pinned yet).
     AcceptNew,
-    /// `StrictHostKeyChecking=no` + `UserKnownHostsFile=/dev/null`: accept any
-    /// key every time, persist nothing. ONLY for machine-provisioned boxes whose
-    /// proxy `host:port` pairs are recycled by the provider, where a real pin
-    /// would just produce spurious mismatches (see `openresearch_ssh_target`).
+    /// `StrictHostKeyChecking=accept-new` against a persistent orx-private
+    /// `known_hosts` (see `private_known_hosts`): trust-on-first-use — the
+    /// first connection records the key, and a later mismatch fail-closes.
+    /// Pins live outside the user's own `~/.ssh/known_hosts`; one shared file
+    /// suffices, since ssh matches entries by `host:port`. For
+    /// machine-provisioned boxes identified by a provider-assigned `host:port`
+    /// (see `openresearch_ssh_target`). If the provider recycles that
+    /// `host:port` onto a box with a different key, connections fail closed
+    /// until the stale entry is removed from that file — intentional, not a
+    /// bug: this channel carries source packages and synced environment
+    /// variables, and silently trusting whatever answers would be worse.
     Ephemeral,
 }
 
@@ -181,9 +189,9 @@ impl SshTarget {
             HostKeyPolicy::Ephemeral => {
                 extra_opts.extend([
                     "-o".into(),
-                    "StrictHostKeyChecking=no".into(),
+                    "StrictHostKeyChecking=accept-new".into(),
                     "-o".into(),
-                    format!("UserKnownHostsFile={}", discarded_known_hosts().display()),
+                    format!("UserKnownHostsFile={}", private_known_hosts().display()),
                     "-o".into(),
                     "LogLevel=ERROR".into(),
                 ]);
@@ -193,15 +201,29 @@ impl SshTarget {
     }
 }
 
-#[cfg(unix)]
-fn discarded_known_hosts() -> PathBuf {
-    PathBuf::from("/dev/null")
+/// The persistent orx-private `known_hosts` backing
+/// [`HostKeyPolicy::Ephemeral`]: first-seen keys are pinned here, outside the
+/// user's own `~/.ssh/known_hosts`. One shared file — ssh matches entries by
+/// `host:port`.
+fn private_known_hosts() -> PathBuf {
+    crate::config::config_dir().join("known_hosts")
 }
 
-/// Windows' OpenSSH has no `/dev/null`, and would create a `\dev\null` on the current drive.
-#[cfg(not(unix))]
-fn discarded_known_hosts() -> std::path::PathBuf {
-    crate::config::config_dir().join("ephemeral-known-hosts")
+/// accept-new must be able to record the first-seen key, or `Ephemeral`
+/// targets would silently degrade to accepting any key on every connection
+/// (with `LogLevel=ERROR` even ssh's "failed to add" warning stays hidden).
+fn ensure_known_hosts_dir() -> Result<()> {
+    let parent = private_known_hosts()
+        .parent()
+        .ok_or_else(|| anyhow!("known_hosts path has no parent"))?
+        .to_path_buf();
+    std::fs::create_dir_all(&parent).map_err(|e| {
+        anyhow!(
+            "Could not create the SSH known_hosts directory {}: {e}",
+            parent.display()
+        )
+    })?;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1011,20 +1033,19 @@ mod tests {
         assert!(joined.contains("StrictHostKeyChecking=accept-new"));
         assert!(!joined.contains("/dev/null"));
 
-        // Ephemeral: provider box — accept-anything, persist nothing. Assert the
-        // EXACT vector so the openresearch backend (which relies on this shape,
-        // incl. LogLevel=ERROR and ordering) can't silently drift.
+        // Ephemeral: provider box — TOFU into an orx-private known_hosts, not
+        // the user's own. Assert the EXACT vector so the openresearch backend
+        // (which relies on this shape, incl. LogLevel=ERROR and ordering)
+        // can't silently drift.
         let t = SshTarget::host_port("root@h".into(), 2222, HostKeyPolicy::Ephemeral);
         let (head, known_hosts, tail) = (&t.extra_opts[..5], &t.extra_opts[5], &t.extra_opts[6..]);
-        assert_eq!(head, ["-p", "2222", "-o", "StrictHostKeyChecking=no", "-o"]);
+        assert_eq!(head, ["-p", "2222", "-o", "StrictHostKeyChecking=accept-new", "-o"]);
         assert_eq!(tail, ["-o", "LogLevel=ERROR"]);
-        #[cfg(unix)]
-        assert_eq!(known_hosts, "UserKnownHostsFile=/dev/null");
-        // By shape: on Windows it follows XDG_CONFIG_HOME, which telemetry tests mutate.
-        #[cfg(not(unix))]
+        // By shape: it follows XDG_CONFIG_HOME, which telemetry tests mutate.
         assert!(
             known_hosts.starts_with("UserKnownHostsFile=")
-                && known_hosts.ends_with("ephemeral-known-hosts")
+                && known_hosts.ends_with("known_hosts"),
+            "{known_hosts}"
         );
     }
 

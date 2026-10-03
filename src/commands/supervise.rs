@@ -925,11 +925,11 @@ async fn run_openresearch(
         let script = crate::compute::staged_script(&stored.command);
         let script =
             openresearch::wrap_with_timeout(&script, descriptor.timeout_secs.unwrap_or(4 * 3600));
-        let mut env: std::collections::HashMap<String, String> =
+        // The box env: backends only receive the environment the user explicitly
+        // synced; a HuggingFace token must be synced explicitly if a remote
+        // backend needs it.
+        let env: std::collections::HashMap<String, String> =
             crate::config::list_synced_env().into_iter().collect();
-        if let Ok(hf_token) = hf::resolve_token() {
-            env.entry("HF_TOKEN".to_string()).or_insert(hf_token);
-        }
         // sshd and the org key sync can lag a freshly-online box, so the
         // launch retries for ~2 minutes before giving up.
         let mut launch_err = None;

@@ -7,7 +7,7 @@ use crate::commands::exp::spawn_detached_supervise;
 use crate::compute::SourceSnapshot;
 use crate::error::{anyhow, Result};
 use crate::jobs::ssh::sh_quote;
-use crate::jobs::{huggingface, ray, BackendDescriptor};
+use crate::jobs::{ray, BackendDescriptor};
 use crate::store::{now_ms, Store, StoredRun};
 
 /// CLI wrapper: submit, then print the summary.
@@ -90,13 +90,11 @@ pub async fn submit_local_ray_with_source(
 
     // Ray submission ids: letters, digits, dashes, underscores.
     let submission_id = format!("orx-{}", run_id.replace('-', ""));
-    // The job env: everything the user synced (API keys), plus the tokens the
-    // run step expects. Ray renders runtime_env in its dashboard, but anyone
+    // The job env: backends only receive the environment the user explicitly
+    // synced; a HuggingFace token must be synced explicitly if a remote
+    // backend needs it. Ray renders runtime_env in its dashboard, but anyone
     // with dashboard access can submit jobs anyway — same trust boundary.
-    let mut env: HashMap<String, String> = crate::config::list_synced_env().into_iter().collect();
-    if let Ok(hf_token) = huggingface::resolve_token() {
-        env.entry("HF_TOKEN".to_string()).or_insert(hf_token);
-    }
+    let env: HashMap<String, String> = crate::config::list_synced_env().into_iter().collect();
     let mut metadata = HashMap::new();
     metadata.insert("or_run".to_string(), run_id.clone());
     metadata.insert("or_experiment".to_string(), exp.id.clone());

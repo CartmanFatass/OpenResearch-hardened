@@ -73,12 +73,10 @@ pub async fn submit_local_ssh_with_source(
     .await?;
     let script = crate::compute::staged_script(&run_command);
 
-    // The remote env: everything the user synced (API keys), plus the tokens
-    // the run script expects. Exported inside run.sh (written owner-only).
-    let mut env: HashMap<String, String> = crate::config::list_synced_env().into_iter().collect();
-    if let Ok(hf_token) = crate::jobs::huggingface::resolve_token() {
-        env.entry("HF_TOKEN".to_string()).or_insert(hf_token);
-    }
+    // The remote env: backends only receive the environment the user
+    // explicitly synced; a HuggingFace token must be synced explicitly if a
+    // remote backend needs it. Exported inside run.sh (written owner-only).
+    let env: HashMap<String, String> = crate::config::list_synced_env().into_iter().collect();
 
     let mut descriptor = BackendDescriptor {
         ssh_container: container.clone(),

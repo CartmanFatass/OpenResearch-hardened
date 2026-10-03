@@ -113,13 +113,10 @@ pub async fn submit_local_k8s_with_source(
 
     let script = crate::compute::gated_script("/tmp/orx-source/source.tar", &run_command);
 
-    // The pod's env: everything the user synced (API keys), plus the tokens
-    // the run script and common tooling expect. Travels via a k8s Secret,
-    // never on a command line.
-    let mut env: HashMap<String, String> = crate::config::list_synced_env().into_iter().collect();
-    if let Ok(hf_token) = hf::resolve_token() {
-        env.entry("HF_TOKEN".to_string()).or_insert(hf_token);
-    }
+    // The pod's env: backends only receive the environment the user explicitly
+    // synced; a HuggingFace token must be synced explicitly if a remote
+    // backend needs it. Travels via a k8s Secret, never on a command line.
+    let env: HashMap<String, String> = crate::config::list_synced_env().into_iter().collect();
     let mut labels = HashMap::new();
     labels.insert("or_run".to_string(), run_id.clone());
     labels.insert("or_experiment".to_string(), exp.id.clone());

@@ -83,13 +83,11 @@ pub async fn submit_local_modal_with_source(
         .unwrap_or_else(|| modal::default_image(resources.gpu.is_some()));
     let script = crate::compute::gated_script("/tmp/orx-source.tar", &run_command);
 
-    // The sandbox's env: everything the user synced (API keys), plus the tokens
-    // the run script and common tooling expect. Rides an ephemeral Modal
-    // Secret, never the plain env arg.
-    let mut env: HashMap<String, String> = crate::config::list_synced_env().into_iter().collect();
-    if let Ok(hf_token) = hf::resolve_token() {
-        env.entry("HF_TOKEN".to_string()).or_insert(hf_token);
-    }
+    // The sandbox's env: backends only receive the environment the user
+    // explicitly synced; a HuggingFace token must be synced explicitly if a
+    // remote backend needs it. Rides an ephemeral Modal Secret, never the
+    // plain env arg.
+    let env: HashMap<String, String> = crate::config::list_synced_env().into_iter().collect();
     let mut tags = HashMap::new();
     tags.insert("or_run".to_string(), run_id.clone());
     tags.insert("or_experiment".to_string(), exp.id.clone());

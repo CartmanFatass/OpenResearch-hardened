@@ -210,8 +210,9 @@ impl BackendDescriptor {
 
     /// The box's SSH endpoint as a ready-to-use target, once the supervisor
     /// has recorded it (openresearch_job only). Uses
-    /// [`ssh::HostKeyPolicy::Ephemeral`] — see its docs for why these
-    /// machine-provisioned, host:port-recycled boxes accept any key.
+    /// [`ssh::HostKeyPolicy::Ephemeral`] — see its docs for how these
+    /// machine-provisioned, host:port-recycled boxes pin host keys, and why a
+    /// key change on a recycled `host:port` fails closed.
     pub fn openresearch_ssh_target(&self) -> Option<ssh::SshTarget> {
         if self.kind != "openresearch_job" {
             return None;
@@ -358,7 +359,7 @@ mod tests {
         assert_eq!(target.dest, "root@203.0.113.7");
         let opts = target.extra_opts.join(" ");
         assert!(opts.contains("-p 22022"), "{opts}");
-        assert!(opts.contains("StrictHostKeyChecking=no"), "{opts}");
+        assert!(opts.contains("StrictHostKeyChecking=accept-new"), "{opts}");
     }
 
     #[test]

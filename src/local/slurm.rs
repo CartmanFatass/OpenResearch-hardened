@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use crate::commands::exp::spawn_detached_supervise;
 use crate::compute::SourceSnapshot;
 use crate::error::{anyhow, Result};
-use crate::jobs::{huggingface, slurm, BackendDescriptor};
+use crate::jobs::{slurm, BackendDescriptor};
 use crate::store::{now_ms, Store, StoredRun};
 
 /// CLI wrapper around `submit_local_slurm`: submit, then print the summary.
@@ -93,12 +93,10 @@ pub async fn submit_local_slurm_with_source(
         .or_else(|| project.run_command.clone().filter(|c| !c.trim().is_empty()))
         .ok_or_else(|| anyhow!("{}", crate::invocation::no_run_command(&project.id)))?;
 
-    // The job env: everything the user synced (API keys), plus the tokens the
-    // run step expects. Exported in the setup script and job.sbatch.
-    let mut env: HashMap<String, String> = crate::config::list_synced_env().into_iter().collect();
-    if let Ok(hf_token) = huggingface::resolve_token() {
-        env.entry("HF_TOKEN".to_string()).or_insert(hf_token);
-    }
+    // The job env: backends only receive the environment the user explicitly
+    // synced; a HuggingFace token must be synced explicitly if a remote
+    // backend needs it. Exported in the setup script and job.sbatch.
+    let env: HashMap<String, String> = crate::config::list_synced_env().into_iter().collect();
     crate::jobs::ssh::stage_source(
         &crate::jobs::ssh::SshTarget::alias(&host),
         &run_id,
