@@ -10090,12 +10090,14 @@ mod bridge_tests {
         // Read-only Bash: allowed without a card.
         assert!(allow(plan_auto_policy(
             "Bash",
-            &json!({"command": "orx runs 2>&1 | head -50"})
+            &json!({"command": "orx runs p-1 2>&1 | head -50"})
         )));
-        assert!(allow(plan_auto_policy(
+        // Git can execute configured helpers even for nominal reads.
+        assert!(plan_auto_policy(
             "Bash",
             &json!({"command": "git show origin/b:f.py | head -100"})
-        )));
+        )
+        .is_none());
         // Gray-area Bash: the user's call — card.
         assert!(plan_auto_policy("Bash", &json!({"command": "cargo metadata"})).is_none());
         assert!(plan_auto_policy("Bash", &json!({"command": "rm -rf /"})).is_none());

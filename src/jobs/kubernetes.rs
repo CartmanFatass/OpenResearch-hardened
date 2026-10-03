@@ -15,7 +15,7 @@
 //! - the Job's container command must reference `$ORX_SCRIPT`, the injected
 //!   env var holding the snapshot-and-run script (the run command stays the
 //!   experiment's fixed contract);
-//! - orx injects run labels, the `orx-env` Secret ref, and defaults for
+//! - orx injects run labels, a run-specific Secret ref, and defaults for
 //!   `activeDeadlineSeconds` / `ttlSecondsAfterFinished` / `backoffLimit`
 //!   when the manifest doesn't set them;
 //! - `{{ORX_RUN}}` in the manifest text is replaced with a run-unique,
@@ -40,10 +40,8 @@ use tokio::process::Command;
 
 use crate::error::{anyhow, Result};
 
-/// Env vars land in this namespace-local Secret; the primary Job gets an
-/// `envFrom` ref injected (`optional: true`, so an empty env file is fine);
-/// auxiliary resources reference it themselves if they need the keys.
-/// Re-synced on every launch; pods read it once at start.
+/// Legacy manifest alias. References are rewritten to an immutable per-run
+/// Secret; an old namespace-wide Secret is never read or overwritten.
 pub const ENV_SECRET: &str = "orx-env";
 
 /// Label that picks the primary Job when a manifest contains several.
@@ -238,7 +236,7 @@ pub struct ManifestSpec {
     pub script: String,
     /// Run-unique DNS-safe token substituted for `{{ORX_RUN}}`.
     pub run_token: String,
-    /// Synced into the `orx-env` Secret.
+    /// Snapshotted into an immutable run-specific Secret, including an empty map.
     pub env: HashMap<String, String>,
     /// Injected as `activeDeadlineSeconds` when the manifest doesn't set one.
     pub timeout_seconds: u64,
@@ -253,25 +251,14 @@ pub struct Submitted {
     pub resources: Vec<String>,
 }
 
-/// Sync the env Secret, then validate and create the manifest's resources.
+/// Validate and create the manifest and its immutable, Job-owned env Secret.
 /// On a partial failure everything already created is rolled back.
 pub async fn run_manifest(
     context: Option<&str>,
     namespace: &str,
     spec: &ManifestSpec,
 ) -> Result<Submitted> {
-    if !spec.env.is_empty() {
-        // stringData via stdin — values never appear on a command line.
-        let secret = json!({
-            "apiVersion": "v1",
-            "kind": "Secret",
-            "metadata": { "name": ENV_SECRET, "namespace": namespace,
-                          "labels": { "app.kubernetes.io/managed-by": "orx" } },
-            "type": "Opaque",
-            "stringData": spec.env,
-        });
-        kubectl(context, &["apply", "-f", "-"], Some(&secret.to_string())).await?;
-    }
+    let secret_name = run_env_secret_name(&spec.run_token)?;
 
     let rendered = spec.manifest.replace("{{ORX_RUN}}", &spec.run_token);
     // YAML → JSON plus schema sanity in one step, without touching the
@@ -305,24 +292,39 @@ pub async fn run_manifest(
         &spec.script,
         spec.timeout_seconds,
         &spec.labels,
+        &secret_name,
     )?;
 
-    // Create one resource at a time so a failure can roll back exactly what
-    // exists so far (a multi-doc `kubectl create` stops mid-way but doesn't
-    // undo).
+    // Create the Secret only after its primary Job supplies an owner UID. The
+    // required ref holds the pod pending until then. Never apply a shared Secret:
+    // queued/concurrent runs must retain their own credential snapshot.
     let mut created: Vec<String> = Vec::new();
-    for doc in &docs {
-        let handle = resource_handle(doc);
-        if let Err(e) = kubectl(context, &["create", "-f", "-"], Some(&doc.to_string())).await {
-            for r in created.iter().rev() {
-                let _ = delete_resources(context, namespace, std::slice::from_ref(r)).await;
+    let submission = async {
+        for doc in &docs {
+            let handle = resource_handle(doc);
+            let primary = doc["kind"] == "Job" && doc["metadata"]["name"] == job_name;
+            let args: &[&str] = if primary {
+                &["create", "-f", "-", "-o", "json"]
+            } else {
+                &["create", "-f", "-"]
+            };
+            let output = kubectl(context, args, Some(&doc.to_string()))
+                .await
+                .map_err(|error| anyhow!("could not create {handle}: {error}"))?;
+            created.push(handle);
+            if primary {
+                let job: Value = serde_json::from_str(&output)?;
+                let secret = run_env_secret(&secret_name, namespace, &spec.env, &job)?;
+                kubectl(context, &["create", "-f", "-"], Some(&secret.to_string())).await?;
+                created.push(resource_handle(&secret));
             }
-            return Err(anyhow!("could not create {handle}: {e}"));
         }
-        created.push(handle);
+        stage_source(context, namespace, &job_name, &spec.source_archive).await
     }
-    let staged = stage_source(context, namespace, &job_name, &spec.source_archive).await;
-    if let Err(error) = staged {
+    .await;
+    if let Err(error) = submission {
+        // Best-effort each resource separately: a failed delete must not leave
+        // the remaining resources (especially the credential Secret) untouched.
         for resource in created.iter().rev() {
             let _ = delete_resources(context, namespace, std::slice::from_ref(resource)).await;
         }
@@ -393,6 +395,77 @@ async fn stage_source(
     ))
 }
 
+fn run_env_secret_name(run_token: &str) -> Result<String> {
+    let valid_edge = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+    if run_token.is_empty()
+        || run_token.len() > 55
+        || !valid_edge(run_token.as_bytes()[0])
+        || !valid_edge(*run_token.as_bytes().last().unwrap())
+        || !run_token
+            .bytes()
+            .all(|byte| valid_edge(byte) || byte == b'-')
+    {
+        return Err(anyhow!("invalid run token for Kubernetes env Secret"));
+    }
+    Ok(format!("{ENV_SECRET}-{run_token}"))
+}
+
+fn run_env_secret(
+    name: &str,
+    namespace: &str,
+    env: &HashMap<String, String>,
+    job: &Value,
+) -> Result<Value> {
+    let uid = job["metadata"]["uid"]
+        .as_str()
+        .filter(|uid| !uid.is_empty())
+        .ok_or_else(|| anyhow!("created Kubernetes Job did not return its UID"))?;
+    Ok(json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": name,
+            "namespace": namespace,
+            "labels": { "app.kubernetes.io/managed-by": "orx" },
+            "ownerReferences": [{
+                "apiVersion": "batch/v1", "kind": "Job",
+                "name": job["metadata"]["name"], "uid": uid,
+            }],
+        },
+        "immutable": true,
+        "type": "Opaque",
+        "stringData": env,
+    }))
+}
+
+/// Preserve explicit legacy references on auxiliary workloads while preventing
+/// any pod from silently reading a stale namespace-wide credential snapshot.
+fn rewrite_env_secret_refs(value: &mut Value, name: &str) {
+    match value {
+        Value::Object(object) => {
+            for field in ["secretRef", "secretKeyRef", "secret"] {
+                if let Some(reference) = object.get_mut(field).and_then(Value::as_object_mut) {
+                    for key in ["name", "secretName"] {
+                        if reference.get(key).and_then(Value::as_str) == Some(ENV_SECRET) {
+                            reference.insert(key.into(), json!(name));
+                            reference.insert("optional".into(), json!(false));
+                        }
+                    }
+                }
+            }
+            for child in object.values_mut() {
+                rewrite_env_secret_refs(child, name);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                rewrite_env_secret_refs(child, name);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn resource_handle(doc: &Value) -> String {
     format!(
         "{}/{}",
@@ -410,7 +483,8 @@ fn resource_handle(doc: &Value) -> String {
 /// primary Job's containers must reference `$ORX_SCRIPT`.
 ///
 /// Injections: run labels on every doc (and the primary Job's pod template);
-/// `ORX_SCRIPT` env + `orx-env` envFrom on the primary Job's containers;
+/// `ORX_SCRIPT` env on primary Job containers, a required run-specific envFrom
+/// on its script container, and rewritten explicit legacy Secret references;
 /// `activeDeadlineSeconds` / `ttlSecondsAfterFinished` / `backoffLimit`
 /// defaults on the primary Job when absent.
 fn prepare_docs(
@@ -419,6 +493,7 @@ fn prepare_docs(
     script: &str,
     timeout_seconds: u64,
     labels: &HashMap<String, String>,
+    secret_name: &str,
 ) -> Result<(Vec<Value>, String)> {
     // Flatten kubectl's shapes: a stream of objects, any of which may itself
     // be a v1 List.
@@ -442,6 +517,13 @@ fn prepare_docs(
                  records what it created for cancel/cleanup); a {} is missing one. \
                  Use {{{{ORX_RUN}}}} in names to keep re-runs collision-free.",
                 if kind.is_empty() { "resource" } else { kind }
+            ));
+        }
+        if kind == "Secret"
+            && [ENV_SECRET, secret_name].contains(&doc["metadata"]["name"].as_str().unwrap_or(""))
+        {
+            return Err(anyhow!(
+                "the manifest must not define the orx-managed env Secret"
             ));
         }
         if let Some(ns) = doc["metadata"]["namespace"].as_str() {
@@ -499,6 +581,7 @@ fn prepare_docs(
         }
     };
     for doc in &mut docs {
+        rewrite_env_secret_refs(doc, secret_name);
         doc["metadata"]["namespace"] = json!(namespace);
         label_map(&mut doc["metadata"]["labels"]);
     }
@@ -530,17 +613,17 @@ fn prepare_docs(
     let mut script_container = None;
     let mut script_container_count = 0usize;
     for c in containers.iter_mut() {
-        for field in ["command", "args"] {
-            if let Some(items) = c[field].as_array() {
-                if items
+        let runs_script = ["command", "args"].iter().any(|field| {
+            c[*field].as_array().is_some_and(|items| {
+                items
                     .iter()
-                    .any(|a| a.as_str().is_some_and(|s| s.contains("ORX_SCRIPT")))
-                {
-                    script_container_count += 1;
-                    if script_container.is_none() {
-                        script_container = c["name"].as_str().map(str::to_string);
-                    }
-                }
+                    .any(|arg| arg.as_str().is_some_and(|s| s.contains("ORX_SCRIPT")))
+            })
+        });
+        if runs_script {
+            script_container_count += 1;
+            if script_container.is_none() {
+                script_container = c["name"].as_str().map(str::to_string);
             }
         }
         let env = c["env"]
@@ -567,11 +650,15 @@ fn prepare_docs(
             .map(std::mem::take)
             .unwrap_or_default();
         let mut env_from: Vec<Value> = env_from;
-        if !env_from
-            .iter()
-            .any(|e| e["secretRef"]["name"] == ENV_SECRET)
-        {
-            env_from.push(json!({ "secretRef": { "name": ENV_SECRET, "optional": true } }));
+        if runs_script {
+            if let Some(reference) = env_from
+                .iter_mut()
+                .find(|e| e["secretRef"]["name"] == secret_name)
+            {
+                reference["secretRef"]["optional"] = json!(false);
+            } else {
+                env_from.push(json!({ "secretRef": { "name": secret_name, "optional": false } }));
+            }
         }
         c["envFrom"] = json!(env_from);
     }
@@ -924,7 +1011,104 @@ mod tests {
     }
 
     fn prepare(v: Value) -> Result<(Vec<Value>, String)> {
-        prepare_docs(vec![v], "default", "echo hi", 14400, &labels())
+        prepare_docs(
+            vec![v],
+            "default",
+            "echo hi",
+            14400,
+            &labels(),
+            "orx-env-r1",
+        )
+    }
+
+    #[test]
+    fn run_secret_names_are_distinct_valid_and_bounded() {
+        assert_ne!(
+            run_env_secret_name("a1").unwrap(),
+            run_env_secret_name("b2").unwrap()
+        );
+        assert_eq!(run_env_secret_name(&"a".repeat(55)).unwrap().len(), 63);
+        for invalid in ["", "-a", "a-", "UPPER", "a/b", "a.b", "a\nb"] {
+            assert!(run_env_secret_name(invalid).is_err(), "{invalid:?}");
+        }
+        assert!(run_env_secret_name(&"a".repeat(56)).is_err());
+    }
+
+    #[test]
+    fn empty_run_secret_has_no_stale_keys_and_is_garbage_collected_with_job() {
+        let owner = json!({ "metadata": { "name": "train", "uid": "job-uid" } });
+        let old = HashMap::from([("HF_TOKEN".into(), "old-token".into())]);
+        let previous = run_env_secret("orx-env-a1", "default", &old, &owner).unwrap();
+        let empty = run_env_secret("orx-env-b2", "default", &HashMap::new(), &owner).unwrap();
+        assert_eq!(previous["stringData"]["HF_TOKEN"], "old-token");
+        assert_eq!(empty["stringData"], json!({}));
+        assert_eq!(empty["immutable"], true);
+        assert_eq!(empty["metadata"]["ownerReferences"][0]["uid"], "job-uid");
+        assert_eq!(empty["metadata"]["ownerReferences"][0]["name"], "train");
+        assert_eq!(resource_handle(&empty), "secret/orx-env-b2");
+        assert!(run_env_secret("orx-env-b2", "default", &old, &job("train")).is_err());
+    }
+
+    #[test]
+    fn explicit_legacy_secret_references_follow_the_run_without_changing_other_secrets() {
+        let mut document = json!({ "spec": {
+            "containers": [{
+                "envFrom": [{ "secretRef": { "name": ENV_SECRET, "optional": true } },
+                            { "secretRef": { "name": "unrelated" } }],
+                "env": [{ "valueFrom": { "secretKeyRef": { "name": ENV_SECRET, "key": "TOKEN" } } }],
+            }],
+            "volumes": [{ "secret": { "secretName": ENV_SECRET } },
+                        { "projected": { "sources": [{ "secret": { "name": ENV_SECRET } }] } }],
+        }});
+        rewrite_env_secret_refs(&mut document, "orx-env-r1");
+        let container = &document["spec"]["containers"][0];
+        assert_eq!(container["envFrom"][0]["secretRef"]["name"], "orx-env-r1");
+        assert_eq!(container["envFrom"][0]["secretRef"]["optional"], false);
+        assert_eq!(container["envFrom"][1]["secretRef"]["name"], "unrelated");
+        assert_eq!(
+            container["env"][0]["valueFrom"]["secretKeyRef"]["name"],
+            "orx-env-r1"
+        );
+        assert_eq!(
+            document["spec"]["volumes"][0]["secret"]["secretName"],
+            "orx-env-r1"
+        );
+        assert_eq!(
+            document["spec"]["volumes"][1]["projected"]["sources"][0]["secret"]["name"],
+            "orx-env-r1"
+        );
+    }
+
+    #[test]
+    fn manifest_cannot_define_the_managed_secret() {
+        for name in [ENV_SECRET, "orx-env-r1"] {
+            let secret = json!({ "kind": "Secret", "metadata": { "name": name } });
+            assert!(prepare(json!({ "kind": "List", "items": [job("train"), secret] })).is_err());
+        }
+    }
+
+    #[test]
+    fn automatic_credentials_are_run_specific_and_required() {
+        let (docs, _) = prepare(job("train-r1")).unwrap();
+        let reference =
+            &docs[0]["spec"]["template"]["spec"]["containers"][0]["envFrom"][0]["secretRef"];
+        assert_eq!(reference["name"], "orx-env-r1");
+        assert_eq!(reference["optional"], false);
+    }
+
+    #[test]
+    fn unrelated_sidecars_do_not_receive_automatic_credentials() {
+        let mut j = job("train-r1");
+        j["spec"]["template"]["spec"]["containers"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "name": "metrics", "image": "metrics", "command": ["sleep", "60"] }));
+        let (docs, _) = prepare(j).unwrap();
+        assert!(
+            docs[0]["spec"]["template"]["spec"]["containers"][1]["envFrom"]
+                .as_array()
+                .is_none_or(Vec::is_empty)
+        );
     }
 
     #[test]
@@ -941,7 +1125,7 @@ mod tests {
         let c = &j["spec"]["template"]["spec"]["containers"][0];
         assert_eq!(c["env"][0]["name"], "ORX_SCRIPT");
         assert_eq!(c["env"][0]["value"], "echo hi");
-        assert_eq!(c["envFrom"][0]["secretRef"]["name"], ENV_SECRET);
+        assert_eq!(c["envFrom"][0]["secretRef"]["name"], "orx-env-r1");
     }
 
     #[test]
@@ -979,6 +1163,7 @@ mod tests {
             "echo hi",
             14400,
             &labels(),
+            "orx-env-r1",
         )
         .unwrap();
         assert_eq!(docs.len(), 2);
@@ -1076,6 +1261,144 @@ mod tests {
             .collect();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0]["value"], "0");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_secret_lifecycle_uses_isolated_snapshots_and_rolls_back() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = crate::local::git::TemporaryDirectory::new("orx-k8s-secrets").unwrap();
+        let executable = temp.path().join("kubectl");
+        std::fs::write(
+            &executable,
+            r#"#!/usr/bin/env python3
+import json, os, pathlib, sys
+root = pathlib.Path(os.environ['ORX_K8S_TEST_DIR'])
+args = sys.argv[1:]
+state_path = root / 'state.json'
+state = json.loads(state_path.read_text()) if state_path.exists() else {
+    'secret/orx-env': {'stringData': {'OLD_TOKEN': 'legacy'}}
+}
+def save():
+    state_path.write_text(json.dumps(state))
+if args[0] == 'create':
+    doc = json.load(sys.stdin)
+    if '--dry-run=client' in args:
+        print(json.dumps(doc)); sys.exit(0)
+    kind = doc['kind']
+    failure = root / 'fail-kind'
+    if failure.exists() and failure.read_text() == kind:
+        sys.stderr.write('fixture create failed'); sys.exit(1)
+    handle = kind.lower() + '/' + doc['metadata']['name']
+    if handle in state:
+        sys.stderr.write('AlreadyExists'); sys.exit(1)
+    doc['metadata']['uid'] = 'uid-' + doc['metadata']['name']
+    state[handle] = doc
+    save()
+    print(json.dumps(doc))
+elif args[0] == 'delete':
+    state.pop(args[1], None); save()
+elif args[:2] == ['get', 'pods']:
+    print('fixture-pod')
+elif args[0] not in ('cp', 'exec'):
+    sys.stderr.write('unexpected kubectl operation: ' + repr(args)); sys.exit(1)
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = std::iter::once(temp.path().to_path_buf())
+            .chain(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            ))
+            .collect::<Vec<_>>();
+        // A child test process receives PATH: never mutate the parallel test
+        // runner's environment or risk invoking a real cluster's kubectl.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "jobs::kubernetes::tests::manifest_secret_lifecycle_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("ORX_K8S_TEST_DIR", temp.path())
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "invoked in an isolated subprocess by manifest_secret_lifecycle_uses_isolated_snapshots_and_rolls_back"]
+    async fn manifest_secret_lifecycle_child() {
+        let Some(root) = std::env::var_os("ORX_K8S_TEST_DIR").map(PathBuf::from) else {
+            return;
+        };
+        let spec = |token: &str, env: HashMap<String, String>| ManifestSpec {
+            manifest: job(&format!("train-{token}")).to_string(),
+            script: "echo hi".into(),
+            run_token: token.into(),
+            env,
+            timeout_seconds: 120,
+            labels: labels(),
+            source_archive: root.join("source.tar"),
+        };
+        let first = spec(
+            "a1",
+            HashMap::from([("HF_TOKEN".into(), "old-token".into())]),
+        );
+        let submitted = run_manifest(None, "default", &first).await.unwrap();
+        assert_eq!(submitted.resources, ["job/train-a1", "secret/orx-env-a1"]);
+        let empty = spec("b2", HashMap::new());
+        run_manifest(None, "default", &empty).await.unwrap();
+        let read_state = || -> Value {
+            serde_json::from_str(&std::fs::read_to_string(root.join("state.json")).unwrap())
+                .unwrap()
+        };
+        let state = read_state();
+        assert_eq!(state["secret/orx-env"]["stringData"]["OLD_TOKEN"], "legacy");
+        assert_eq!(
+            state["secret/orx-env-a1"]["stringData"]["HF_TOKEN"],
+            "old-token"
+        );
+        assert_eq!(state["secret/orx-env-b2"]["stringData"], json!({}));
+        assert_eq!(
+            state["secret/orx-env-b2"]["metadata"]["ownerReferences"][0]["uid"],
+            "uid-train-b2"
+        );
+        // A collision must fail without overwriting an existing run's secret
+        // or deleting its resources during rollback.
+        assert!(run_manifest(None, "default", &first).await.is_err());
+        assert_eq!(read_state(), state);
+
+        std::fs::write(root.join("fail-kind"), "Secret").unwrap();
+        assert!(run_manifest(None, "default", &spec("c3", HashMap::new()))
+            .await
+            .is_err());
+        assert_eq!(read_state(), state);
+
+        std::fs::write(root.join("fail-kind"), "ConfigMap").unwrap();
+        let mut later_failure = spec("d4", HashMap::new());
+        later_failure.manifest = json!({ "kind": "List", "items": [job("train-d4"), {
+            "kind": "ConfigMap", "metadata": { "name": "later" },
+        }] })
+        .to_string();
+        assert!(run_manifest(None, "default", &later_failure).await.is_err());
+        assert_eq!(read_state(), state);
+
+        delete_resources(None, "default", &submitted.resources)
+            .await
+            .unwrap();
+        let state = read_state();
+        assert!(state.get("job/train-a1").is_none());
+        assert!(state.get("secret/orx-env-a1").is_none());
+        assert!(state.get("secret/orx-env-b2").is_some());
+        assert!(state.get("secret/orx-env").is_some());
     }
 
     fn reconnect<'a>(resume: &mut LogResume, raw: &[&'a str]) -> Vec<&'a str> {

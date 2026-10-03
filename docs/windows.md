@@ -1,5 +1,11 @@
 # Windows
 
+> **Fork installation notice:** This document describes upstream packaging.
+> Downloads or install commands pointing to `alphaXiv/OpenResearch` install
+> upstream binaries without this fork's hardening. To use the hardened fork,
+> follow [the source-build instructions](../README.md#get-started).
+
+
 Windows support is in beta. The CLI and dashboard work, including local
 experiment runs and the nanochat demo. The gaps are listed at the bottom.
 

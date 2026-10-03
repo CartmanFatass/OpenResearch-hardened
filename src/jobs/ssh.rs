@@ -40,7 +40,7 @@ fn control_dir() -> PathBuf {
 }
 
 #[cfg(unix)]
-fn prepare_control_dir() -> Result<()> {
+fn prepare_control_dir(target: &SshTarget) -> Result<()> {
     let dir = control_dir();
     std::fs::create_dir_all(&dir).map_err(|e| {
         anyhow!(
@@ -61,14 +61,13 @@ fn prepare_control_dir() -> Result<()> {
     let mut permissions = metadata.permissions();
     permissions.set_mode(0o700);
     std::fs::set_permissions(&dir, permissions)?;
-    // Runs before every ssh invocation, so accept-new can always record keys.
-    ensure_known_hosts_dir()
+    prepare_private_known_hosts(target)
 }
 
 #[cfg(not(unix))]
-fn prepare_control_dir() -> Result<()> {
-    // No control dir on Windows; still ensure accept-new can record keys.
-    ensure_known_hosts_dir()
+fn prepare_control_dir(target: &SshTarget) -> Result<()> {
+    // No control dir on Windows; still preflight the private pin store.
+    prepare_private_known_hosts(target)
 }
 
 #[derive(Debug, Clone)]
@@ -138,6 +137,8 @@ pub struct SshTarget {
     pub dest: String,
     /// Extra ssh args before `--` (e.g. `["-p", "2222", "-o", …]`).
     pub extra_opts: Vec<String>,
+    /// Exact filesystem path, separate from OpenSSH option quoting/expansion.
+    pub(crate) managed_known_hosts: Option<PathBuf>,
 }
 
 /// How to treat the remote's SSH host key for a `host_port` target.
@@ -171,6 +172,7 @@ impl SshTarget {
         Self {
             dest: host.to_string(),
             extra_opts: Vec::new(),
+            managed_known_hosts: None,
         }
     }
 
@@ -181,23 +183,30 @@ impl SshTarget {
     /// across call sites.
     pub fn host_port(dest: String, port: u16, policy: HostKeyPolicy) -> Self {
         let mut extra_opts = vec!["-p".into(), port.to_string()];
+        let mut managed_known_hosts = None;
         match policy {
             HostKeyPolicy::UserConfig => {}
             HostKeyPolicy::AcceptNew => {
                 extra_opts.extend(["-o".into(), "StrictHostKeyChecking=accept-new".into()]);
             }
             HostKeyPolicy::Ephemeral => {
+                let path = private_known_hosts();
                 extra_opts.extend([
                     "-o".into(),
                     "StrictHostKeyChecking=accept-new".into(),
                     "-o".into(),
-                    format!("UserKnownHostsFile={}", private_known_hosts().display()),
+                    known_hosts_option(&path),
                     "-o".into(),
                     "LogLevel=ERROR".into(),
                 ]);
+                managed_known_hosts = Some(path);
             }
         }
-        Self { dest, extra_opts }
+        Self {
+            dest,
+            extra_opts,
+            managed_known_hosts,
+        }
     }
 }
 
@@ -209,20 +218,111 @@ fn private_known_hosts() -> PathBuf {
     crate::config::config_dir().join("known_hosts")
 }
 
-/// accept-new must be able to record the first-seen key, or `Ephemeral`
-/// targets would silently degrade to accepting any key on every connection
-/// (with `LogLevel=ERROR` even ssh's "failed to add" warning stays hidden).
-fn ensure_known_hosts_dir() -> Result<()> {
-    let parent = private_known_hosts()
+/// OpenSSH can succeed even when accept-new cannot persist a key. Refuse
+/// unusable private pin stores before sending source or credentials. This is
+/// a filesystem preflight, not a guarantee against later disk-full/path races.
+/// UserConfig/AcceptNew targets retain their normal OpenSSH configuration.
+fn prepare_private_known_hosts(target: &SshTarget) -> Result<()> {
+    if let Some(path) = &target.managed_known_hosts {
+        prepare_known_hosts_file(path)?;
+    }
+    Ok(())
+}
+
+fn known_hosts_option(path: &std::path::Path) -> String {
+    // This is OpenSSH config syntax, not shell quoting. Quoting keeps a space
+    // inside one filename; %% prevents token expansion from changing the path.
+    let escaped = path
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('%', "%%");
+    format!("UserKnownHostsFile=\"{escaped}\"")
+}
+
+fn prepare_known_hosts_file(path: &std::path::Path) -> Result<()> {
+    let text = path
+        .to_str()
+        .ok_or_else(|| anyhow!("SSH known_hosts path must be UTF-8"))?;
+    // OpenSSH expands ${VAR} even inside quoted paths, with no portable
+    // literal-dollar escape. Reject it instead of preflighting a different file.
+    if !path.is_absolute() || text.contains("${") || text.chars().any(char::is_control) {
+        return Err(anyhow!("SSH known_hosts path must be absolute and contain no environment expansion or control characters"));
+    }
+    let parent = path
         .parent()
-        .ok_or_else(|| anyhow!("known_hosts path has no parent"))?
-        .to_path_buf();
-    std::fs::create_dir_all(&parent).map_err(|e| {
+        .ok_or_else(|| anyhow!("known_hosts path has no parent"))?;
+    std::fs::create_dir_all(parent).map_err(|error| {
         anyhow!(
-            "Could not create the SSH known_hosts directory {}: {e}",
+            "Could not create SSH known_hosts directory {}: {error}",
             parent.display()
         )
     })?;
+    let directory = std::fs::symlink_metadata(parent)?;
+    if !directory.is_dir() {
+        return Err(anyhow!(
+            "SSH known_hosts parent must be a real directory: {}",
+            parent.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let uid = unsafe { libc::geteuid() };
+        if directory.uid() != uid || directory.mode() & 0o022 != 0 {
+            return Err(anyhow!(
+                "SSH known_hosts directory is not owner-controlled: {}",
+                parent.display()
+            ));
+        }
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(anyhow!(
+                "SSH known_hosts must be a regular non-symlink file: {}",
+                path.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // NOFOLLOW also closes the final-component symlink race. NONBLOCK
+        // prevents a substituted FIFO from hanging this preflight.
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path).map_err(|error| {
+        anyhow!(
+            "SSH known_hosts is not readable and writable at {}: {error}",
+            path.display()
+        )
+    })?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(anyhow!(
+            "SSH known_hosts must be a regular file: {}",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let uid = unsafe { libc::geteuid() };
+        if metadata.uid() != uid || metadata.mode() & 0o022 != 0 || metadata.mode() & 0o600 != 0o600
+        {
+            return Err(anyhow!(
+                "SSH known_hosts must be owner-readable/writable and not writable by others: {}",
+                path.display()
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -288,7 +388,7 @@ pub(crate) fn forward_args(
     forward: &str,
     remote_cmd: &str,
 ) -> Result<Vec<String>> {
-    prepare_control_dir()?;
+    prepare_control_dir(target)?;
     let mut args = ssh_opts(target, true);
     args.extend(["-o".into(), "ExitOnForwardFailure=yes".into()]);
     args.extend([
@@ -318,7 +418,7 @@ pub(crate) async fn interactive_args(
     target: &SshTarget,
     persist: Option<u64>,
 ) -> Result<InteractiveConnection> {
-    prepare_control_dir()?;
+    prepare_control_dir(target)?;
     #[cfg(unix)]
     let lock = {
         let file = std::fs::OpenOptions::new()
@@ -365,7 +465,7 @@ pub(crate) async fn master_is_running(_target: &SshTarget) -> Result<bool> {
 
 #[cfg(unix)]
 pub(crate) async fn master_is_running(target: &SshTarget) -> Result<bool> {
-    prepare_control_dir()?;
+    prepare_control_dir(target)?;
     let path = control_path(target);
     if !path.try_exists()? {
         return Ok(false);
@@ -402,7 +502,7 @@ async fn ssh_run_bytes(
     remote_cmd: &str,
     stdin: Option<&[u8]>,
 ) -> Result<String> {
-    prepare_control_dir()?;
+    prepare_control_dir(target)?;
     let mut cmd = Command::new("ssh");
     cmd.args(ssh_opts(target, true))
         .arg("--")
@@ -455,7 +555,7 @@ async fn ssh_run_file(
     remote_cmd: &str,
     source: &std::path::Path,
 ) -> Result<String> {
-    prepare_control_dir()?;
+    prepare_control_dir(target)?;
     let mut child = Command::new("ssh")
         .args(ssh_opts(target, true))
         .arg("--")
@@ -831,7 +931,7 @@ mod tests {
     async fn interactive_login_removes_orphaned_sockets_and_broken_symlinks() {
         use std::os::unix::{fs::symlink, net::UnixListener};
         let target = SshTarget::alias(&format!("orx-test-{}", uuid::Uuid::new_v4()));
-        prepare_control_dir().unwrap();
+        prepare_control_dir(&target).unwrap();
         let path = control_path(&target);
         drop(UnixListener::bind(&path).unwrap());
         interactive_args(&target, None).await.unwrap();
@@ -1011,6 +1111,75 @@ mod tests {
     }
 
     #[test]
+    fn private_pin_store_rejects_directories_and_preserves_existing_pins() {
+        let temp = crate::local::git::TemporaryDirectory::new("orx-pin-store").unwrap();
+        let path = temp.path().join("known_hosts");
+        std::fs::create_dir(&path).unwrap();
+        assert!(prepare_known_hosts_file(&path).is_err());
+        std::fs::remove_dir(&path).unwrap();
+        prepare_known_hosts_file(&path).unwrap();
+        std::fs::write(&path, "host ssh-ed25519 existing-key\n").unwrap();
+        prepare_known_hosts_file(&path).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "host ssh-ed25519 existing-key\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_pin_store_rejects_symlinks_readonly_and_shared_writes() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+        let temp = crate::local::git::TemporaryDirectory::new("orx-pin-store-unix").unwrap();
+        let path = temp.path().join("known_hosts");
+        let target = temp.path().join("target");
+        std::fs::write(&target, "untouched").unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(prepare_known_hosts_file(&path).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
+        std::fs::remove_file(&path).unwrap();
+        prepare_known_hosts_file(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        for mode in [0o400, 0o620, 0o602] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(prepare_known_hosts_file(&path).is_err(), "mode {mode:o}");
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(prepare_known_hosts_file(&path).is_err());
+    }
+
+    #[test]
+    fn private_pin_path_uses_literal_ssh_config_quoting() {
+        let path = std::path::Path::new("/tmp/pins with %h and \"quotes\"/known_hosts");
+        assert_eq!(
+            known_hosts_option(path),
+            "UserKnownHostsFile=\"/tmp/pins with %%h and \\\"quotes\\\"/known_hosts\""
+        );
+        for invalid in [
+            "relative/known_hosts",
+            "/tmp/${HOME}/known_hosts",
+            "/tmp/new\nline/known_hosts",
+        ] {
+            assert!(prepare_known_hosts_file(std::path::Path::new(invalid)).is_err());
+        }
+    }
+
+    #[test]
+    fn user_config_targets_do_not_require_a_private_pin_store() {
+        assert!(prepare_private_known_hosts(&SshTarget::alias("host")).is_ok());
+        assert!(prepare_private_known_hosts(&SshTarget::host_port(
+            "host".into(),
+            22,
+            HostKeyPolicy::AcceptNew,
+        ))
+        .is_ok());
+    }
+
+    #[test]
     fn alias_target_adds_no_extra_opts() {
         let target = SshTarget::alias("mybox");
         assert_eq!(target.dest, "mybox");
@@ -1046,7 +1215,8 @@ mod tests {
         assert_eq!(tail, ["-o", "LogLevel=ERROR"]);
         // By shape: it follows XDG_CONFIG_HOME, which telemetry tests mutate.
         assert!(
-            known_hosts.starts_with("UserKnownHostsFile=") && known_hosts.ends_with("known_hosts"),
+            known_hosts.starts_with("UserKnownHostsFile=")
+                && known_hosts.ends_with("known_hosts\""),
             "{known_hosts}"
         );
     }
@@ -1085,6 +1255,7 @@ mod tests {
         let mk = |port: &str| SshTarget {
             dest: "root@h".to_string(),
             extra_opts: vec!["-p".into(), port.into()],
+            managed_known_hosts: None,
         };
         assert_ne!(control_path(&mk("22022")), control_path(&mk("22023")));
         assert_eq!(control_path(&mk("22022")), control_path(&mk("22022")));

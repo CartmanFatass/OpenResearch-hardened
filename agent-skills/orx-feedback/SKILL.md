@@ -5,14 +5,15 @@ description: "Report product feedback about OpenResearch itself with `orx feedba
 
 # Report product feedback
 
-`orx feedback` sends a report straight to the OpenResearch team, so user pain
-reaches them without the user filing anything. Keep the bar high: a few precise
-reports are worth more than many vague ones. Always tell the user before you
-file: never submit a report they have not been told about.
+`orx feedback` sends a report to the OpenResearch team through the configured
+OpenResearch API. Reports may contain command inputs, error text and quoted user
+words. Keep the bar high: a few precise reports are worth more than many vague
+ones. Obtain explicit user consent to the report and its destination before
+running the command. Enabling analytics does not grant consent to send reports.
 
-## When to file
+## When to prepare a report
 
-File a report only when one of these holds:
+Consider a report only when one of these holds:
 
 - The user explicitly shows frustration with an OpenResearch feature or bug.
 - The user explicitly says a feature would be nice to have.
@@ -23,6 +24,20 @@ File a report only when one of these holds:
 Do not file for minor nits, for problems in the user's own code or
 environment, or for a limitation you already reported earlier in this
 session. File at most one report per turn.
+
+## Get consent
+
+Show the user the proposed kind, summary, details and optional quote, and identify
+who receives them: the OpenResearch team at the configured API destination. Ask
+whether to send that report, then wait for an affirmative answer. If the API
+points somewhere else, disclose that actual destination before asking. Never
+send merely because the user expressed frustration, requested a feature, or was
+notified that you intended to send. An explicit user request to send an already
+specified report to that destination is sufficient; do not ask again.
+
+These are agent behavior instructions, not a technical security boundary. The
+CLI and each harness's permission mode may permit network calls without a card.
+Never rely on a permission prompt to obtain consent on your behalf.
 
 ## How to file
 
@@ -57,7 +72,14 @@ public inputs. Rephrase `--quote` only as needed to remove sensitive details.
 
 ## Tell the user
 
-Never file silently: in the same turn you run the command, tell the user a
-report was filed, its `--kind`, and the gist of what it says. If the command
-rejects a value as invalid or too long, fix it and run it once more; for any
-other failure, drop the report and tell the user it could not be filed.
+After running the approved command, report the actual outcome. Say it was sent
+only when the CLI or service explicitly confirms submission. Exit code zero
+alone is insufficient: versions of the CLI may return success without sending
+when telemetry or the build channel disables feedback. If feedback is disabled,
+say the report was not sent; never enable telemetry to get around that gate. If
+the result is uncertain, say submission is unconfirmed and do not retry blindly.
+Include the report kind and gist when confirming a verified submission.
+
+If a value is rejected as invalid or too long, revise the draft and ask the user
+to approve the changed report before trying again. For other failures, stop and
+tell the user the report could not be confirmed as sent.

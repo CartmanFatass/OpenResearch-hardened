@@ -34,6 +34,7 @@ struct Context {
 pub async fn run(args: crate::FeedbackArgs) -> Result<()> {
     // Same gate as analytics: nothing from development builds or opted-out users.
     if crate::telemetry::effective_disabled_reason().is_some() {
+        println!("Feedback not sent: telemetry is disabled or this build is ineligible.");
         return Ok(());
     }
     let feedback = Feedback {
@@ -52,7 +53,9 @@ pub async fn run(args: crate::FeedbackArgs) -> Result<()> {
         },
     };
     let creds = crate::config::load_credentials().await.ok().flatten();
-    crate::client::submit_feedback(creds.as_ref(), &feedback).await
+    crate::client::submit_feedback(creds.as_ref(), &feedback).await?;
+    println!("Feedback submitted to the configured OpenResearch service.");
+    Ok(())
 }
 
 #[cfg(test)]
