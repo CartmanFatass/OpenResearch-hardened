@@ -4394,13 +4394,20 @@ impl axum::body::HttpBody for ActiveBody {
 
 /// Relaunch into an update installed underneath this server once that interrupts nothing,
 /// so a long-lived `orx up` stops launching runs and building sandboxes with old code.
+///
+/// This follows an install that already happened — the new binary is on disk —
+/// so it is not gated on the `autoUpdate` preference (which in this fork only
+/// controls unattended download-and-execute, and is opt-in by default). It is
+/// still silenced by the hard update opt-outs (`ORX_NO_UPDATE_CHECK`,
+/// `OPENRESEARCH_CLI_DISABLE_UPDATE`, ...), which the status exposes as
+/// `env_disabled`.
 fn spawn_restart_when_idle(state: AppState) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(UPDATE_SAMPLE_INTERVAL).await;
             let status = updates::status();
             // The cache can claim an install the exec target doesn't have; never restart in a loop.
-            if !(status.auto_update
+            if !(!status.env_disabled
                 && status.restart_required
                 && updates::newer_exe_on_disk().await)
             {
